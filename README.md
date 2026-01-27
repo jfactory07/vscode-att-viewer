@@ -1,31 +1,34 @@
-# VS Code 扩展：ATT Trace Viewer
+# ATT Trace Viewer (VS Code extension)
 
-在 VS Code 里用 Webview 交互式查看 ROCm Advanced Thread Trace（ATT）：
+Interactive timeline viewer for ROCm Advanced Thread Trace (ATT) inside VS Code, implemented as a Webview:
 
-- 横轴：cycle
-- 颜色：指令类别（VALU/LDS/VMEM/IMMED…）
-- Hover：指令反汇编文本 + issue cycle + duration/stall + PC
-- 交互：滚轮缩放、拖拽平移、纵向滚动（按 wave lane）
+- X-axis: cycles
+- Color: instruction category (VALU/LDS/VMEM/IMMED/...)
+- Hover: instruction text + issue cycle + duration/stall + PC
+- Interactions: mouse-wheel zoom, drag-to-pan, vertical scroll (per wave lane)
 
-## 安装（开发模式）
+## Install (development)
 
-1. 打开 VS Code
-2. `Run and Debug` → `Run Extension`（或命令行 `code --extensionDevelopmentPath=/mnt/att-analysis/vscode-att-viewer`）
+Open this folder in VS Code and run the extension host:
 
-## 使用
+- VS Code: `Run and Debug` -> `Run Extension`
+- CLI: `code --extensionDevelopmentPath=/mnt/att-analysis/vscode-att-viewer`
 
-- 命令面板：`ATT Viewer: Open ATT Trace`
-- 或资源管理器右键 `.att` 文件：`ATT Viewer: Open ATT Trace (from file)`
+## Usage
 
-插件会：
-1. 在 `.att` 同目录寻找 `*_results.db`
-2. 用 `results.db` 的 `rocpd_info_code_object_*` 表定位 `*_code_object_id_*.out`
-3. 运行内置 `python/att2json.py` 生成 trace JSON（缓存到 VS Code globalStorage）
-4. 打开 Webview 渲染
+- Command palette: `ATT Viewer: Open ATT Trace`
+- Explorer context menu on `.att`: `ATT Viewer: Open ATT Trace (from file)`
 
-## 设置项
+The extension will:
 
-- `attViewer.pythonPath`：默认 `python3`
-- `attViewer.gpuArch`：默认 `gfx950`
-- `attViewer.maxEvents`：默认 0（全量）；大 trace 建议先设例如 200000
+1. Look for `*_results.db` in the same directory as the `.att` file
+2. Use `results.db` tables `rocpd_info_code_object_*` to locate `*_code_object_id_*.out` files
+3. Run the bundled `python/att2json.py` to decode the trace to JSON (cached under VS Code `globalStorage`)
+4. Open a Webview panel to render the timeline
+
+## Settings
+
+- `attViewer.pythonPath` (default: `python3`)
+- `attViewer.gpuArch` (default: `gfx950`)
+- `attViewer.maxEvents` (default: 0 = all; for large traces, start with e.g. 200000)
 
