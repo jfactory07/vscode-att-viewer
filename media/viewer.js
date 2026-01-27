@@ -5,6 +5,7 @@
   const vscode = acquireVsCodeApi();
 
   const jsonUri = window.__ATT_JSON_URI__;
+  const traceKey = window.__ATT_TRACE_KEY__ || "";
   const metaEl = document.getElementById("meta");
   const legendEl = document.getElementById("legend");
   const viewport = document.getElementById("viewport");
@@ -179,9 +180,14 @@
       buildCfgUI();
       renderLegend();
       requestDraw();
+    } else if (msg.type === "markers" && Array.isArray(msg.value)) {
+      MARKERS = msg.value.map((x) => Number(x)).filter((x) => Number.isFinite(x));
+      MARKERS.sort((a, b) => a - b);
+      requestDraw();
     }
   });
   vscode.postMessage({ type: "requestColors" });
+  vscode.postMessage({ type: "requestMarkers", traceKey });
 
   // ---- source/disassembly pane ----
   let currentMarkerId = null;
@@ -190,6 +196,7 @@
   let selected = null; // { marker_id, pc, lane, issue }
   let sourceMode = "disasm"; // "disasm" | "occ"
   let occSelectedKey = null; // `${lane}|${issue}|${pc}`
+  let occLaneFilter = null; // null = all lanes, else lane id number
   // register selection/highlighting in disasm
   let regSel = null; // { key: string, atoms: Set<string>, focusLine: number }
   let regSelVersion = 0;
@@ -788,19 +795,51 @@
       srcBody.appendChild(d);
       return;
     }
-    const events = (hit.idxs || []).map((i) => DATA.events[i]).slice().sort((a, b) => a.issue - b.issue);
+    const allEvents = (hit.idxs || []).map((i) => DATA.events[i]).slice().sort((a, b) => a.issue - b.issue);
+    const events = occLaneFilter == null ? allEvents : allEvents.filter((e) => e.lane === occLaneFilter);
+
+    // lane filter UI
+    const controls = document.createElement("div");
+    controls.className = "occControls";
+    const lab = document.createElement("span");
+    lab.className = "occHint";
+    lab.style.margin = "0";
+    lab.textContent = "Lane:";
+    const sel = document.createElement("select");
+    sel.className = "occLaneSel";
+    const optAll = document.createElement("option");
+    optAll.value = "all";
+    optAll.textContent = "all";
+    sel.appendChild(optAll);
+    for (let l = 0; l < lanes; l++) {
+      const o = document.createElement("option");
+      o.value = String(l);
+      o.textContent = `w${l}`;
+      sel.appendChild(o);
+    }
+    sel.value = occLaneFilter == null ? "all" : String(occLaneFilter);
+    sel.addEventListener("change", () => {
+      const v = sel.value;
+      occLaneFilter = v === "all" ? null : Number(v);
+      occSelectedKey = null; // selection may be filtered out
+      renderOccurrences(markerId, pc);
+    });
+    controls.appendChild(lab);
+    controls.appendChild(sel);
+    srcBody.appendChild(controls);
 
     const asm = events[0].asm || "";
     const hint = document.createElement("div");
     hint.className = "occHint";
-    hint.textContent = `${asm || "(unknown)"}   marker=${markerId} pc=0x${Number(pc).toString(16)}   count=${events.length}`;
+    const laneSuffix = occLaneFilter == null ? "" : `   lane=w${occLaneFilter}`;
+    hint.textContent = `${asm || "(unknown)"}   marker=${markerId} pc=0x${Number(pc).toString(16)}   count=${events.length}${laneSuffix}`;
     srcBody.appendChild(hint);
 
     const table = document.createElement("table");
     table.className = "occTable";
     table.innerHTML = `
       <thead><tr>
-        <th>#</th><th>lane</th><th>t0</th><th>t_issue</th><th>t_end</th><th>stall</th><th>exec</th><th>dur</th><th>cat</th>
+        <th>#</th><th>lane</th><th>t0</th><th>Δt0</th><th>stall</th><th>exec</th><th>dur</th><th>cat</th>
       </tr></thead>
       <tbody></tbody>`;
     srcBody.appendChild(table);
@@ -817,9 +856,8 @@
         const stall = Math.max(0, e.stall || 0);
         const dur = Math.max(1, e.duration || 1);
         const t0 = e.issue;
-        const tIssue = t0 + stall;
-        const tEnd = t0 + dur;
         const exec = Math.max(0, dur - stall);
+        const dt0 = i > 0 ? (t0 - (events[i - 1].issue || 0)) : null;
         const tr = document.createElement("tr");
         tr.className = "occRow";
         const rowKey = `${e.lane}|${e.issue}|${e.pc}`;
@@ -828,8 +866,7 @@
           <td>${i}</td>
           <td>${e.lane}</td>
           <td>${t0}</td>
-          <td>${tIssue}</td>
-          <td>${tEnd}</td>
+          <td>${dt0 == null ? "" : dt0}</td>
           <td>${stall}</td>
           <td>${exec}</td>
           <td>${dur}</td>
@@ -918,6 +955,24 @@
   }
 
   let view = { min: DATA.min_cycle, max: DATA.max_cycle };
+  // user markers (vertical lines)
+  let MARKERS = [];
+  const MARKER_COLOR = "#ff3b30";
+
+  function saveMarkers() {
+    vscode.postMessage({ type: "saveMarkers", traceKey, value: MARKERS });
+  }
+
+  function findMarkerNear(xPx, tolPx) {
+    if (!MARKERS.length) return null;
+    let best = null;
+    let bestDx = Infinity;
+    for (const cyc of MARKERS) {
+      const dx = Math.abs(xScale(cyc) - xPx);
+      if (dx < bestDx) { bestDx = dx; best = cyc; }
+    }
+    return bestDx <= tolPx ? best : null;
+  }
 
   function resize() {
     const width = viewport.clientWidth;
@@ -1106,6 +1161,28 @@
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     drawGrid();
     drawEvents();
+    // user markers (draw over events)
+    if (MARKERS && MARKERS.length) {
+      ctx.save();
+      for (const cyc of MARKERS) {
+        const x = Math.round(xScale(cyc)) + 0.5;
+        // black outline underlay
+        ctx.strokeStyle = "rgba(0,0,0,0.75)";
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+        // main marker
+        ctx.strokeStyle = MARKER_COLOR;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
     drawMeasureOverlay();
     // selected outline
     if (selected) {
@@ -1237,6 +1314,25 @@
   canvas.addEventListener("click", (ev) => {
     // Ignore click after a ctrl+drag measurement to avoid accidental selection.
     if (measure && (measure.active || measure.justFinished)) return;
+    // Alt+click: add/remove a marker at this cycle
+    if (ev.altKey) {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left + viewport.scrollLeft;
+      const cycle = cycleAtX(x);
+      const cyc = Math.round(cycle);
+      const near = findMarkerNear(x, 6);
+      if (near != null && Math.abs(near - cyc) <= Math.max(2, Math.round((view.max - view.min) / canvas.width) * 3)) {
+        MARKERS = MARKERS.filter((v) => v !== near);
+      } else {
+        if (!MARKERS.includes(cyc)) MARKERS.push(cyc);
+      }
+      MARKERS.sort((a, b) => a - b);
+      saveMarkers();
+      requestDraw();
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
@@ -1257,6 +1353,7 @@
   canvas.addEventListener("dblclick", (ev) => {
     // Ignore dblclick after a ctrl+drag measurement.
     if (measure && (measure.active || measure.justFinished)) return;
+    if (ev.altKey) return;
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;

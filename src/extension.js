@@ -48,7 +48,7 @@ function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
 }
 
-function getWebviewHtml(webview, ctx, jsonUri) {
+function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
   const scriptUri = webview.asWebviewUri(
     vscode.Uri.joinPath(ctx.extensionUri, "media", "viewer.js")
   );
@@ -78,7 +78,7 @@ function getWebviewHtml(webview, ctx, jsonUri) {
       <div class="meta" id="meta"></div>
       <div class="legend" id="legend"></div>
       <button class="btn" id="colorsBtn" title="Edit colors">Colors</button>
-      <div class="hint">wheel=zoom, drag=pan</div>
+      <div class="hint">wheel=zoom, drag=pan, alt+click=marker</div>
     </div>
     <div class="main">
       <div class="viewport" id="viewport">
@@ -106,6 +106,7 @@ function getWebviewHtml(webview, ctx, jsonUri) {
     </div>
     <script nonce="${nonce}">
       window.__ATT_JSON_URI__ = "${jsonUri.toString()}";
+      window.__ATT_TRACE_KEY__ = "${String(traceKey || "")}";
     </script>
     <script nonce="${nonce}" src="${scriptUri}"></script>
   </body>
@@ -201,13 +202,15 @@ async function openAttImpl(context, attUri) {
   );
 
   const jsonUri = panel.webview.asWebviewUri(vscode.Uri.file(outJson));
-  panel.webview.html = getWebviewHtml(panel.webview, context, jsonUri);
+  const traceKey = sha1(attPath);
+  panel.webview.html = getWebviewHtml(panel.webview, context, jsonUri, traceKey);
 
   // In-panel disassembly cache
   const disasmCache = new Map(); // key: gpuArch|path -> lines
 
   // Persisted color config (global across traces)
   const getSavedColors = () => context.globalState.get("attViewer.colors", null);
+  const getSavedMarkers = () => context.globalState.get(`attViewer.markers.${traceKey}`, []);
   // eslint-disable-next-line no-unused-vars
   panel.webview.onDidReceiveMessage(async (msg) => {
     if (!msg || !msg.type) return;
@@ -216,6 +219,12 @@ async function openAttImpl(context, attUri) {
     } else if (msg.type === "saveColors") {
       await context.globalState.update("attViewer.colors", msg.value || null);
       panel.webview.postMessage({ type: "colorsSaved" });
+    } else if (msg.type === "requestMarkers") {
+      panel.webview.postMessage({ type: "markers", value: getSavedMarkers() });
+    } else if (msg.type === "saveMarkers") {
+      const arr = Array.isArray(msg.value) ? msg.value : [];
+      await context.globalState.update(`attViewer.markers.${traceKey}`, arr);
+      panel.webview.postMessage({ type: "markersSaved" });
     } else if (msg.type === "requestDisasm") {
       const gpuArch = msg.gpuArch;
       const codeobjPath = msg.codeobjPath;
@@ -254,6 +263,10 @@ async function openAttImpl(context, attUri) {
   const initial = getSavedColors();
   if (initial) {
     panel.webview.postMessage({ type: "colors", value: initial });
+  }
+  const initialMarkers = getSavedMarkers();
+  if (initialMarkers && initialMarkers.length) {
+    panel.webview.postMessage({ type: "markers", value: initialMarkers });
   }
 }
 

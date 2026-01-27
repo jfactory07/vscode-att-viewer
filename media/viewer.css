@@ -61,6 +61,16 @@ html, body {
 .occRow:hover { background: rgba(255,255,255,0.06); }
 .occRow.selected { background: rgba(255,255,255,0.16); outline: 1px solid rgba(255,255,255,0.22); }
 .occHint { color: rgba(255,255,255,0.55); font-size: 12px; margin: 6px 0 10px 0; }
+.occControls { display: flex; align-items: center; gap: 8px; margin: 6px 0 6px 0; }
+.occLaneSel {
+  background: #0f1012;
+  border: 1px solid rgba(255,255,255,0.22);
+  color: rgba(255,255,255,0.95);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.occLaneSel:focus { outline: 1px solid rgba(255,255,255,0.30); }
 /* virtualized disasm grid */
 .disContainer { padding: 0; position: relative; }
 .disHeader {
