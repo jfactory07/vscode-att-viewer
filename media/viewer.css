@@ -62,7 +62,7 @@ html, body {
 .occRow.selected { background: rgba(255,255,255,0.16); outline: 1px solid rgba(255,255,255,0.22); }
 .occHint { color: rgba(255,255,255,0.55); font-size: 12px; margin: 6px 0 10px 0; }
 /* virtualized disasm grid */
-.disContainer { padding: 0; }
+.disContainer { padding: 0; position: relative; }
 .disHeader {
   position: sticky;
   top: 0;
@@ -70,6 +70,15 @@ html, body {
   background: rgba(20,22,26,0.95);
   border-bottom: 1px solid rgba(255,255,255,0.12);
   font-weight: 600;
+}
+.waitLinkOverlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6; /* above disLayer rows */
+  pointer-events: none;
 }
 .disRow {
   display: grid;
@@ -99,6 +108,27 @@ html, body {
   color: rgba(255,255,255,0.98);
   font-weight: 700;
 }
+.waitBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  font-size: 10px;
+  line-height: 1.2;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.18);
+  color: rgba(255,255,255,0.80);
+  vertical-align: middle;
+}
+.waitBadge.lgkm { background: rgba(0, 170, 255, 0.12); border-color: rgba(0, 170, 255, 0.28); }
+.waitBadge.vm { background: rgba(255, 160, 0, 0.12); border-color: rgba(255, 160, 0, 0.28); }
+.waitHint {
+  margin-left: 10px;
+  color: rgba(255,255,255,0.60);
+  font-size: 11px;
+}
+.disDataRow.waitTargetLgkm { background: rgba(0, 170, 255, 0.07); }
+.disDataRow.waitTargetVmcnt { background: rgba(255, 160, 0, 0.07); }
+.disDataRow.waitFrom { box-shadow: inset 3px 0 0 rgba(255,255,255,0.22); }
 .disBody { position: relative; }
 .disSpacer { position: relative; width: 1px; }
 .disLayer { position: absolute; left: 0; right: 0; top: 0; }

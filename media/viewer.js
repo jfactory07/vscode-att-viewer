@@ -194,6 +194,10 @@
   let regSel = null; // { key: string, atoms: Set<string>, focusLine: number }
   let regSelVersion = 0;
   const REG_HL_FORWARD_LINES = 200;
+  // waitcnt target arrows (derived from disasm text)
+  let waitSel = null; // { fromLine:number, targets:Array<{type:"lgkm"|"vm", n:number, line:number, pc:number}> }
+  let waitSelVersion = 0;
+  const WAIT_SCAN_BACK_LIMIT = 4096;
 
   function escapeHtml(s) {
     return String(s)
@@ -274,6 +278,98 @@
     return out || escapeHtml(s);
   }
 
+  function parseWaitcnt(text) {
+    const s = String(text || "").trim();
+    if (!s) return null;
+    const mnem = s.split(/\s+/)[0] || "";
+    if (mnem !== "s_waitcnt") return null;
+    const lgkmM = s.match(/lgkmcnt\((\d+)\)/);
+    const vmM = s.match(/vmcnt\((\d+)\)/);
+    const lgkm = lgkmM ? Number(lgkmM[1]) : null;
+    const vm = vmM ? Number(vmM[1]) : null;
+    if (lgkm == null && vm == null) return null;
+    return {
+      lgkm: Number.isFinite(lgkm) ? lgkm : null,
+      vm: Number.isFinite(vm) ? vm : null
+    };
+  }
+
+  function mnemOfLineText(text) {
+    const s = String(text || "").trim();
+    if (!s) return "";
+    return (s.split(/\s+/)[0] || "").trim();
+  }
+
+  function isDsReadWrite(text) {
+    const m = mnemOfLineText(text);
+    return /^ds_(read|write)/.test(m);
+  }
+
+  function isBufferLoad(text) {
+    const m = mnemOfLineText(text);
+    return /^buffer_load/.test(m);
+  }
+
+  function findNthPrevLine(fromLineIdx, predicate, nPlus1) {
+    let found = 0;
+    let steps = 0;
+    for (let i = fromLineIdx - 1; i >= 0 && steps < WAIT_SCAN_BACK_LIMIT; i--, steps++) {
+      const t = disasmLines[i] && disasmLines[i].text;
+      if (!t) continue;
+      if (predicate(t)) {
+        found++;
+        if (found === nPlus1) return i;
+      }
+    }
+    return null;
+  }
+
+  function updateWaitSelFromSelected() {
+    if (!selected || !srcBody || !srcBody._pcToLine || !disasmLines || disasmLines.length === 0) {
+      if (waitSel) { waitSel = null; waitSelVersion++; }
+      return;
+    }
+    if (String(selected.marker_id) !== String(currentMarkerId)) {
+      if (waitSel) { waitSel = null; waitSelVersion++; }
+      return;
+    }
+    const fromLine = srcBody._pcToLine.get(Number(selected.pc));
+    if (fromLine == null) {
+      if (waitSel) { waitSel = null; waitSelVersion++; }
+      return;
+    }
+    const ln = disasmLines[fromLine];
+    const info = ln ? parseWaitcnt(ln.text) : null;
+    if (!info) {
+      if (waitSel) { waitSel = null; waitSelVersion++; }
+      return;
+    }
+    const targets = [];
+    if (info.lgkm != null) {
+      const tLine = findNthPrevLine(Number(fromLine), isDsReadWrite, Number(info.lgkm) + 1);
+      if (tLine != null && disasmLines[tLine]) {
+        targets.push({ type: "lgkm", n: Number(info.lgkm), line: Number(tLine), pc: Number(disasmLines[tLine].addr) });
+      }
+    }
+    if (info.vm != null) {
+      const tLine = findNthPrevLine(Number(fromLine), isBufferLoad, Number(info.vm) + 1);
+      if (tLine != null && disasmLines[tLine]) {
+        targets.push({ type: "vm", n: Number(info.vm), line: Number(tLine), pc: Number(disasmLines[tLine].addr) });
+      }
+    }
+    // Only update version if value changed (reduce redraw churn)
+    const next = { fromLine: Number(fromLine), targets };
+    const same =
+      waitSel &&
+      waitSel.fromLine === next.fromLine &&
+      JSON.stringify(waitSel.targets) === JSON.stringify(next.targets);
+    if (!same) {
+      waitSel = next;
+      waitSelVersion++;
+      if (srcBody && typeof srcBody._requestWaitLinks === "function") srcBody._requestWaitLinks();
+    }
+  }
+
   const sourceHeader = srcMeta ? srcMeta.parentElement : null;
   let tabDisasmBtn = null;
   let tabOccBtn = null;
@@ -331,6 +427,7 @@
     const cols = ["74px", "1fr", "52px"];
     for (let w = 0; w < lanes; w++) cols.push("38px");
     const gridTemplateColumns = cols.join(" ");
+    const ADDR_W = 74;
 
     const header = document.createElement("div");
     header.className = "disHeader disRow";
@@ -369,6 +466,129 @@
     disContainer.appendChild(body);
     srcBody.appendChild(disContainer);
 
+    // overlay SVG for waitcnt links (folded polyline with arrow)
+    // IMPORTANT: attach to disBody so it scrolls with rows (no scrollTop compensation needed).
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const waitSvg = document.createElementNS(SVG_NS, "svg");
+    waitSvg.classList.add("waitLinkOverlay");
+    waitSvg.setAttribute("width", "100%");
+    waitSvg.setAttribute("height", "100%");
+    const defs = document.createElementNS(SVG_NS, "defs");
+    // glow/outline to make the link very visible
+    const filter = document.createElementNS(SVG_NS, "filter");
+    filter.setAttribute("id", "waitGlow");
+    filter.setAttribute("x", "-20%");
+    filter.setAttribute("y", "-20%");
+    filter.setAttribute("width", "140%");
+    filter.setAttribute("height", "140%");
+    const blur = document.createElementNS(SVG_NS, "feGaussianBlur");
+    blur.setAttribute("in", "SourceGraphic");
+    blur.setAttribute("stdDeviation", "1.2");
+    blur.setAttribute("result", "blur");
+    const merge = document.createElementNS(SVG_NS, "feMerge");
+    const m1 = document.createElementNS(SVG_NS, "feMergeNode");
+    m1.setAttribute("in", "blur");
+    const m2 = document.createElementNS(SVG_NS, "feMergeNode");
+    m2.setAttribute("in", "SourceGraphic");
+    merge.appendChild(m1);
+    merge.appendChild(m2);
+    filter.appendChild(blur);
+    filter.appendChild(merge);
+    defs.appendChild(filter);
+
+    const mk = (id, color) => {
+      const marker = document.createElementNS(SVG_NS, "marker");
+      marker.setAttribute("id", id);
+      marker.setAttribute("markerWidth", "8");
+      marker.setAttribute("markerHeight", "8");
+      marker.setAttribute("refX", "7");
+      marker.setAttribute("refY", "4");
+      marker.setAttribute("orient", "auto");
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", "M0,0 L8,4 L0,8 Z");
+      path.setAttribute("fill", color);
+      marker.appendChild(path);
+      return marker;
+    };
+    // Use a vivid red like the screenshot. (Both link types share the same look; badges still differentiate.)
+    defs.appendChild(mk("mkLgkm", "#ff3b30"));
+    defs.appendChild(mk("mkVm", "#ff3b30"));
+    waitSvg.appendChild(defs);
+    const linkG = document.createElementNS(SVG_NS, "g");
+    linkG.setAttribute("data-role", "wait-links");
+    waitSvg.appendChild(linkG);
+    body.appendChild(waitSvg);
+
+    let _waitLinkPending = false;
+    function drawWaitLinks() {
+      // Clear
+      while (linkG.firstChild) linkG.removeChild(linkG.firstChild);
+      if (!waitSel || !waitSel.targets || waitSel.targets.length === 0) return;
+
+      // Coordinates are in disBody content space.
+      const yFrom = (waitSel.fromLine * ROW_H) + ROW_H * 0.5;
+      // Match the screenshot: elbow in the left gutter, arrow points into the target row.
+      const xEdge = Math.max(10, Math.min(ADDR_W - 8, 66)); // near end of addr column
+      const xGutter = 10; // left gutter fold
+
+      for (const t of waitSel.targets) {
+        const yTo = (t.line * ROW_H) + ROW_H * 0.5;
+        const isLgkm = t.type === "lgkm";
+        const color = "#ff3b30";
+        const markerId = isLgkm ? "mkLgkm" : "mkVm";
+
+        // folded polyline: from -> gutter -> gutter -> target
+        const pts = `${xEdge},${yFrom} ${xGutter},${yFrom} ${xGutter},${yTo} ${xEdge},${yTo}`;
+        // outline underlay
+        const under = document.createElementNS(SVG_NS, "polyline");
+        under.setAttribute("points", pts);
+        under.setAttribute("fill", "none");
+        under.setAttribute("stroke", "rgba(0,0,0,0.65)");
+        under.setAttribute("stroke-width", "5");
+        under.setAttribute("stroke-linejoin", "round");
+        under.setAttribute("stroke-linecap", "round");
+        under.setAttribute("opacity", "0.85");
+        linkG.appendChild(under);
+        // main line
+        const poly = document.createElementNS(SVG_NS, "polyline");
+        poly.setAttribute("points", pts);
+        poly.setAttribute("fill", "none");
+        poly.setAttribute("stroke", color);
+        poly.setAttribute("stroke-width", "3");
+        poly.setAttribute("stroke-linejoin", "round");
+        poly.setAttribute("stroke-linecap", "round");
+        poly.setAttribute("opacity", "0.98");
+        poly.setAttribute("filter", "url(#waitGlow)");
+        poly.setAttribute("marker-end", `url(#${markerId})`);
+        linkG.appendChild(poly);
+
+        // endpoints
+        const c1 = document.createElementNS(SVG_NS, "circle");
+        c1.setAttribute("cx", String(xEdge));
+        c1.setAttribute("cy", String(yFrom));
+        c1.setAttribute("r", "3.5");
+        c1.setAttribute("fill", color);
+        linkG.appendChild(c1);
+        const c2 = document.createElementNS(SVG_NS, "circle");
+        c2.setAttribute("cx", String(xEdge));
+        c2.setAttribute("cy", String(yTo));
+        c2.setAttribute("r", "3.5");
+        c2.setAttribute("fill", color);
+        linkG.appendChild(c2);
+      }
+    }
+
+    function requestWaitLinks() {
+      if (_waitLinkPending) return;
+      _waitLinkPending = true;
+      requestAnimationFrame(() => {
+        _waitLinkPending = false;
+        drawWaitLinks();
+      });
+    }
+    // allow other codepaths (selection changes) to trigger redraw
+    srcBody._requestWaitLinks = requestWaitLinks;
+
     // map pc -> line index for scrolling/highlight
     const pcToLine = new Map();
     for (let i = 0; i < disasmLines.length; i++) pcToLine.set(Number(disasmLines[i].addr), i);
@@ -377,6 +597,7 @@
     let lastFirst = -1;
     let lastCount = -1;
     let lastRegVer = -1;
+    let lastWaitVer = -1;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -404,9 +625,11 @@
       const overscan = 20;
       const first = Math.max(0, Math.floor(scrollTop / ROW_H) - overscan);
       const count = Math.min(disasmLines.length - first, Math.ceil(viewH / ROW_H) + overscan * 2);
-      if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion) return;
+      // Wait links are attached to disBody and scroll naturally with rows.
+      if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion && lastWaitVer === waitSelVersion) return;
       lastFirst = first; lastCount = count;
       lastRegVer = regSelVersion;
+      lastWaitVer = waitSelVersion;
       ensurePool(count);
       for (let i = 0; i < pool.length; i++) {
         const row = pool[i];
@@ -425,19 +648,40 @@
         const color = COLORS[cat] || "#ddd";
 
         row.classList.toggle("selected", selected && selected.marker_id === currentMarkerId && selected.pc === pc);
+        const isWaitFrom = !!(waitSel && Number(idx) === Number(waitSel.fromLine));
+        const isWaitTlgkm = !!(waitSel && waitSel.targets && waitSel.targets.some((t) => t.type === "lgkm" && Number(t.line) === Number(idx)));
+        const isWaitTvm = !!(waitSel && waitSel.targets && waitSel.targets.some((t) => t.type === "vm" && Number(t.line) === Number(idx)));
+        row.classList.toggle("waitFrom", isWaitFrom);
+        row.classList.toggle("waitTargetLgkm", isWaitTlgkm);
+        row.classList.toggle("waitTargetVmcnt", isWaitTvm);
 
         // fill cells
         const cells = row.children;
         cells[0].className = "disCell disAddrCell";
-        cells[0].textContent = "0x" + pc.toString(16).padStart(4, "0");
+        {
+          const addr = "0x" + pc.toString(16).padStart(4, "0");
+          let badges = "";
+          if (isWaitTlgkm) badges += ` <span class="waitBadge lgkm">LGKM</span>`;
+          if (isWaitTvm) badges += ` <span class="waitBadge vm">VM</span>`;
+          cells[0].innerHTML = escapeHtml(addr) + badges;
+        }
         cells[1].className = "disCell disTextCell";
         // Highlight selected register occurrences in the selected line, as well as:
         // - all prior lines
         // - following lines up to REG_HL_FORWARD_LINES (bounded for performance)
-        cells[1].innerHTML = renderAsmHtmlWithRegs(
+        let txtHtml = renderAsmHtmlWithRegs(
           ln.text,
           !!(regSel && Number(idx) <= (Number(regSel.focusLine) + REG_HL_FORWARD_LINES))
         );
+        if (isWaitFrom && waitSel && waitSel.targets && waitSel.targets.length) {
+          const parts = waitSel.targets.map((t) => {
+            const p = "0x" + Number(t.pc).toString(16);
+            if (t.type === "lgkm") return `LGKM(${t.n}) ↖ ${p}`;
+            return `VM(${t.n}) ↖ ${p}`;
+          });
+          txtHtml += ` <span class="waitHint">${escapeHtml(parts.join("   "))}</span>`;
+        }
+        cells[1].innerHTML = txtHtml;
         cells[1].style.color = color;
         cells[2].className = "disCell disNumCell";
         cells[2].textContent = total ? String(total) : "";
@@ -474,6 +718,7 @@
             panToIssue(hitNow.first);
             const e0 = DATA.events[hitNow.idxs[0]];
             selected = { marker_id: currentMarkerId, pc: pcNow, lane: e0.lane, issue: e0.issue };
+            updateWaitSelFromSelected();
             highlightDisasm(pcNow);
             requestDraw();
           });
@@ -501,6 +746,9 @@
     srcBody._disRowH = ROW_H;
     srcBody._updateDis = updateVisible;
 
+    // recompute wait arrows when disasm changes
+    updateWaitSelFromSelected();
+    requestWaitLinks();
     updateVisible();
   }
 
@@ -598,6 +846,7 @@
           panToIssue(e.issue);
           requestDraw();
           // sync disasm highlight (without switching mode)
+          updateWaitSelFromSelected();
           highlightDisasm(e.pc);
         });
         frag.appendChild(tr);
@@ -624,6 +873,7 @@
     if (!msg || !msg.type) return;
     if (msg.type === "disasm" && msg.lines) {
       renderDisasm(msg.lines);
+      updateWaitSelFromSelected();
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
     } else if (msg.type === "disasmError") {
       if (srcMeta) srcMeta.textContent = `Source: failed (${msg.error || "error"})`;
@@ -998,6 +1248,7 @@
     selected = { marker_id: e.marker_id, pc: e.pc, lane: e.lane, issue: e.issue };
     // ensure correct disasm is loaded
     if (e.marker_id && String(e.marker_id) !== String(currentMarkerId)) requestDisasm(e.marker_id);
+    updateWaitSelFromSelected();
     highlightDisasm(e.pc);
     requestDraw();
   });
@@ -1016,6 +1267,7 @@
     if (!e) return;
     selected = { marker_id: e.marker_id, pc: e.pc, lane: e.lane, issue: e.issue };
     if (e.marker_id && String(e.marker_id) !== String(currentMarkerId)) requestDisasm(e.marker_id);
+    updateWaitSelFromSelected();
     setSourceMode("occ");
   });
 
