@@ -1,0 +1,58 @@
+{
+  "name": "att-trace-viewer",
+  "displayName": "ATT Trace Viewer",
+  "description": "View ROCm Advanced Thread Trace (ATT) in a VS Code webview timeline",
+  "version": "0.0.19",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onCommand:attViewer.openAtt",
+    "onCommand:attViewer.openAttFromUri"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "attViewer.openAtt",
+        "title": "ATT Viewer: Open ATT Trace"
+      },
+      {
+        "command": "attViewer.openAttFromUri",
+        "title": "ATT Viewer: Open ATT Trace (from file)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "attViewer.openAttFromUri",
+          "when": "resourceExtname == .att",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ATT Viewer",
+      "properties": {
+        "attViewer.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable to run the offline ATT decoder"
+        },
+        "attViewer.gpuArch": {
+          "type": "string",
+          "default": "gfx950",
+          "description": "GPU arch passed to llvm-objdump (e.g. gfx950, gfx942)"
+        },
+        "attViewer.maxEvents": {
+          "type": "number",
+          "default": 0,
+          "description": "Cap decoded instruction events (0 = all). Use this to speed up large traces."
+        }
+      }
+    }
+  }
+}
+
