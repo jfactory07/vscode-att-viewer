@@ -8,3 +8,4 @@
 **/node_modules/**
 **/examples/**
 **/*.log
+**/*.vsix

@@ -3,15 +3,30 @@
   "displayName": "ATT Trace Viewer",
   "description": "View ROCm Advanced Thread Trace (ATT) in a VS Code webview timeline",
   "version": "0.0.33",
-  "publisher": "local",
+  "publisher": "jfactory07",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/jfactory07/vscode-att-viewer.git"
+  },
+  "homepage": "https://github.com/jfactory07/vscode-att-viewer#readme",
+  "bugs": {
+    "url": "https://github.com/jfactory07/vscode-att-viewer/issues"
   },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
+  "keywords": [
+    "ROCm",
+    "AMD",
+    "GPU",
+    "ATT",
+    "thread trace",
+    "profiling",
+    "timeline",
+    "trace viewer"
+  ],
   "main": "./src/extension.js",
   "activationEvents": [
     "onCommand:attViewer.openAtt",
