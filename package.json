@@ -2,8 +2,12 @@
   "name": "att-trace-viewer",
   "displayName": "ATT Trace Viewer",
   "description": "View ROCm Advanced Thread Trace (ATT) in a VS Code webview timeline",
-  "version": "0.0.19",
+  "version": "0.0.23",
   "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jfactory07/vscode-att-viewer.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },

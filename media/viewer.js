@@ -193,6 +193,7 @@
   // register selection/highlighting in disasm
   let regSel = null; // { key: string, atoms: Set<string>, focusLine: number }
   let regSelVersion = 0;
+  const REG_HL_FORWARD_LINES = 200;
 
   function escapeHtml(s) {
     return String(s)
@@ -430,9 +431,12 @@
         cells[0].className = "disCell disAddrCell";
         cells[0].textContent = "0x" + pc.toString(16).padStart(4, "0");
         cells[1].className = "disCell disTextCell";
+        // Highlight selected register occurrences in the selected line, as well as:
+        // - all prior lines
+        // - following lines up to REG_HL_FORWARD_LINES (bounded for performance)
         cells[1].innerHTML = renderAsmHtmlWithRegs(
           ln.text,
-          !!(regSel && Number(idx) <= Number(regSel.focusLine))
+          !!(regSel && Number(idx) <= (Number(regSel.focusLine) + REG_HL_FORWARD_LINES))
         );
         cells[1].style.color = color;
         cells[2].className = "disCell disNumCell";
@@ -796,10 +800,63 @@
     });
   }
 
+  // ---- measure range (left-drag) ----
+  // State is defined here so both draw() and event handlers can access it.
+  // Left mouse drag: measure cycle interval (shaded selection + delta label).
+  // Right mouse drag: pan (see handlers below).
+  let measure = null; // { active:boolean, start:number, end:number, justFinished:boolean }
+
+  function drawMeasureOverlay() {
+    if (!measure) return;
+    if (!measure.active && measure.start === measure.end) return;
+
+    const t1 = Math.min(measure.start, measure.end);
+    const t2 = Math.max(measure.start, measure.end);
+    const x1 = xScale(t1);
+    const x2 = xScale(t2);
+    const left = Math.min(x1, x2);
+    const width = Math.max(1, Math.abs(x2 - x1));
+
+    ctx.save();
+    // shaded region + boundary lines
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    ctx.fillRect(left, 0, width, canvas.height);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, 0);
+    ctx.lineTo(left, canvas.height);
+    ctx.moveTo(left + width, 0);
+    ctx.lineTo(left + width, canvas.height);
+    ctx.stroke();
+
+    // label
+    const dt = Math.round(t2 - t1);
+    const label = `Δ ${dt} cycles   [${Math.round(t1)}, ${Math.round(t2)}]`;
+    ctx.font = "12px ui-sans-serif, system-ui";
+    ctx.textBaseline = "top";
+    const padX = 6;
+    const padY = 4;
+    const tw = ctx.measureText(label).width;
+    const bw = tw + padX * 2;
+    const bh = 20;
+    const bx = Math.max(LEFT_PAD + 4, Math.min(left + 4, canvas.width - bw - 4));
+    const by = 4;
+    ctx.fillStyle = "rgba(0,0,0,0.60)";
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 1;
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.fillText(label, bx + padX, by + padY);
+    ctx.restore();
+  }
+
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     drawGrid();
     drawEvents();
+    drawMeasureOverlay();
     // selected outline
     if (selected) {
       const lane = selected.lane;
@@ -928,6 +985,8 @@
 
   // click trace -> select + sync source
   canvas.addEventListener("click", (ev) => {
+    // Ignore click after a ctrl+drag measurement to avoid accidental selection.
+    if (measure && (measure.active || measure.justFinished)) return;
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
@@ -945,6 +1004,8 @@
 
   // double click trace -> open occurrences list
   canvas.addEventListener("dblclick", (ev) => {
+    // Ignore dblclick after a ctrl+drag measurement.
+    if (measure && (measure.active || measure.justFinished)) return;
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
@@ -958,19 +1019,55 @@
     setSourceMode("occ");
   });
 
+  // Ctrl + left-drag measures; left/right drag pans. Disable context menu on canvas.
   let dragging = false;
   let dragX0 = 0;
   let view0 = null;
+  canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
   canvas.addEventListener("mousedown", (ev) => {
-    dragging = true;
-    dragX0 = ev.clientX;
-    view0 = { ...view };
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left + viewport.scrollLeft;
+    const c = cycleAtX(x);
+    // Measurement mode: Ctrl + left mouse
+    if (ev.button === 0 && ev.ctrlKey) {
+      measure = { active: true, start: c, end: c, justFinished: false };
+      requestDraw();
+      ev.preventDefault();
+      return;
+    }
+    // Pan mode (default): left or right mouse drag
+    if (ev.button === 0 || ev.button === 2) {
+      dragging = true;
+      dragX0 = ev.clientX;
+      view0 = { ...view };
+      ev.preventDefault();
+    }
   });
+
   window.addEventListener("mouseup", () => {
-    dragging = false;
-    view0 = null;
+    if (dragging) {
+      dragging = false;
+      view0 = null;
+    }
+    if (measure && measure.active) {
+      measure.active = false;
+      measure.justFinished = true;
+      requestDraw();
+      setTimeout(() => {
+        if (measure) measure.justFinished = false;
+      }, 60);
+    }
   });
+
   window.addEventListener("mousemove", (ev) => {
+    if (measure && measure.active) {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left + viewport.scrollLeft;
+      measure.end = cycleAtX(x);
+      requestDraw();
+      return;
+    }
     if (!dragging || !view0) return;
     const dx = ev.clientX - dragX0;
     const w = canvas.width - LEFT_PAD - 10;
@@ -1017,6 +1114,71 @@
     },
     { passive: false }
   );
+
+  // perfetto-like keyboard shortcuts: WASD to navigate the timeline.
+  function clampView() {
+    if (view.min < DATA.min_cycle) {
+      view.max += DATA.min_cycle - view.min;
+      view.min = DATA.min_cycle;
+    }
+    if (view.max > DATA.max_cycle) {
+      view.min -= view.max - DATA.max_cycle;
+      view.max = DATA.max_cycle;
+    }
+    // Avoid degenerate span
+    const minSpan = 200;
+    if (view.max - view.min < minSpan) view.max = view.min + minSpan;
+  }
+
+  function zoomAt(center, zoomFactor) {
+    const span = (view.max - view.min) * zoomFactor;
+    const minSpan = 200;
+    const maxSpan = DATA.max_cycle - DATA.min_cycle;
+    const newSpan = Math.min(maxSpan, Math.max(minSpan, span));
+    const t = (center - view.min) / (view.max - view.min || 1);
+    view.min = center - t * newSpan;
+    view.max = view.min + newSpan;
+    clampView();
+  }
+
+  function panByCycles(delta) {
+    view.min += delta;
+    view.max += delta;
+    clampView();
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    // don't hijack typing in inputs / pickers
+    const ae = document.activeElement;
+    const tag = ae && ae.tagName ? String(ae.tagName).toLowerCase() : "";
+    if (tag === "input" || tag === "textarea" || tag === "select" || (ae && ae.isContentEditable)) return;
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+    const k = String(ev.key || "").toLowerCase();
+    if (!k || (k !== "w" && k !== "a" && k !== "s" && k !== "d")) return;
+
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const span = view.max - view.min;
+    const accel = ev.shiftKey ? 4.0 : 1.0;
+    const center = (view.min + view.max) * 0.5;
+
+    if (k === "a") {
+      // pan left
+      panByCycles(-span * 0.10 * accel);
+    } else if (k === "d") {
+      // pan right
+      panByCycles(span * 0.10 * accel);
+    } else if (k === "w") {
+      // zoom in
+      zoomAt(center, ev.shiftKey ? 0.75 : 0.85);
+    } else if (k === "s") {
+      // zoom out
+      zoomAt(center, ev.shiftKey ? 1.35 : 1.18);
+    }
+    requestDraw();
+  });
 
   window.addEventListener("resize", resize);
   resize();
