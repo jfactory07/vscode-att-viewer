@@ -28,8 +28,26 @@
   const TOP_PAD = 24;
   const LEFT_PAD = 80;
   const GRID_STEP_PX = 120;
-  // defaults; can be overridden by user config
-  let stallColor = "#ff9aa2";
+  // Built-in defaults (shipped with the extension). User config can override these.
+  const DEFAULT_STALL_COLOR = "#ff9aa2";
+  const BUILTIN_DEFAULT_COLORS = {
+    SMEM: "#6aa84f",
+    SALU: "#ffd966",
+    VMEM: "#e69138",
+    FLAT: "#f6b26b",
+    LDS: "#3c78d8",
+    MFMA: "#ff0000",
+    VALU: "#4b0082",
+    JUMP: "#8e7cc3",
+    NEXT: "#b4a7d6",
+    IMMED: "#999999",
+    CONTEXT: "#76a5af",
+    MESSAGE: "#c27ba0",
+    BVH: "#93c47d",
+    NONE: "#777777",
+  };
+
+  let stallColor = DEFAULT_STALL_COLOR;
 
   function hideLoading() {
     if (loading) loading.style.display = "none";
@@ -46,8 +64,9 @@
   const DATA = await res.json();
   hideLoading();
 
-  // mutable colors map (category -> color hex)
-  let COLORS = { ...(DATA.colors || {}) };
+  // Mutable colors map (category -> color hex).
+  // Start from built-in defaults, then merge any trace-provided colors.
+  let COLORS = { ...BUILTIN_DEFAULT_COLORS, ...(DATA.colors || {}) };
   const CAT_NAMES = DATA.cat_names;
 
   const lanes = DATA.lanes;
@@ -158,8 +177,8 @@
   }
 
   function resetColors() {
-    COLORS = { ...(DATA.colors || {}) };
-    stallColor = "#ff9aa2";
+    COLORS = { ...BUILTIN_DEFAULT_COLORS };
+    stallColor = DEFAULT_STALL_COLOR;
     buildCfgUI();
     renderLegend();
     requestDraw();
@@ -651,6 +670,7 @@
         const pc = Number(ln.addr);
         const hit = pcIndex.get(`${currentMarkerId}|${pc}`);
         const total = hit ? hit.idxs.length : 0;
+        // Disasm instruction text uses per-category coloring (register tokens override to default color).
         const cat = hit && hit.cat ? hit.cat : "NONE";
         const color = COLORS[cat] || "#ddd";
 
