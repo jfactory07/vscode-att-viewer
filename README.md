@@ -7,6 +7,10 @@ Interactive timeline viewer for ROCm Advanced Thread Trace (ATT) inside VS Code,
 - Hover: instruction text + issue cycle + duration/stall + PC
 - Interactions: mouse-wheel zoom, drag-to-pan, vertical scroll (per wave lane)
 
+## Screenshot
+
+![ATT Trace Viewer screenshot](images/screenshot.png)
+
 ## Install (development)
 
 Open this folder in VS Code and run the extension host:
