@@ -107,9 +107,35 @@
     loading.style.display = "block";
   }
 
+  // Surface runtime errors instead of a blank webview.
+  window.addEventListener("error", (ev) => {
+    try {
+      const msg = ev && ev.error && ev.error.stack ? String(ev.error.stack) : String(ev && ev.message ? ev.message : ev);
+      showLoading("ATT Viewer error:\n" + msg);
+    } catch { /* ignore */ }
+  });
+  window.addEventListener("unhandledrejection", (ev) => {
+    try {
+      const r = ev && ev.reason;
+      const msg = r && r.stack ? String(r.stack) : String(r);
+      showLoading("ATT Viewer error:\n" + msg);
+    } catch { /* ignore */ }
+  });
+
   showLoading("Loading trace…");
-  const res = await fetch(jsonUri);
-  const DATA = await res.json();
+  /** @type {any} */
+  let DATA = null;
+  try {
+    const res = await fetch(jsonUri);
+    if (!res.ok) throw new Error(`Failed to load trace JSON (${res.status} ${res.statusText})`);
+    DATA = await res.json();
+  } catch (e) {
+    const msg = (e && e.stack) ? String(e.stack) : String(e);
+    showLoading("ATT Viewer error:\n" + msg);
+    // eslint-disable-next-line no-console
+    console.error(e);
+    return;
+  }
   hideLoading();
 
   // Mutable colors map (category -> color hex).
@@ -1626,8 +1652,8 @@
     requestDraw();
   });
 
-  window.addEventListener("resize", resize);
-  resize();
+    window.addEventListener("resize", resize);
+    resize();
 
   // Restore scroll positions after initial layout (fallback).
   if (_saved && viewport && Number.isFinite(_saved.viewportScrollTop)) {
