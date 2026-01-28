@@ -29,21 +29,42 @@
   function setUiState(state) {
     try { vscode.setState(state); } catch { /* ignore */ }
   }
+  // Guard against early message events before the timeline state is initialized.
+  // (Using `typeof view` is unsafe due to TDZ when `view` is a later `let`.)
+  let _uiReady = false;
+  let _drawRequestedBeforeReady = false;
   let _uiStateTimer = null;
   function scheduleSaveUiState() {
+    if (!_uiReady) return;
     if (_uiStateTimer) clearTimeout(_uiStateTimer);
     _uiStateTimer = setTimeout(() => {
       _uiStateTimer = null;
-      // view/currentMarkerId/selected are defined later; guard at runtime.
+      let v = null;
+      let cm = null;
+      let sel = null;
+      let sm = null;
+      let lf = null;
+      let rs = null;
+      try { v = view ? { min: view.min, max: view.max } : null; } catch { v = null; }
+      try { cm = currentMarkerId; } catch { cm = null; }
+      try { sel = selected; } catch { sel = null; }
+      try { sm = sourceMode; } catch { sm = null; }
+      try { lf = occLaneFilter; } catch { lf = null; }
+      try {
+        rs = regSel
+          ? { key: regSel.key, focusLine: regSel.focusLine, atomsKey: Array.from(regSel.atoms || []).join(",") }
+          : null;
+      } catch { rs = null; }
+
       const st = {
-        view: (typeof view !== "undefined" && view) ? { min: view.min, max: view.max } : null,
+        view: v,
         viewportScrollTop: viewport ? viewport.scrollTop : 0,
         srcScrollTop: srcBody ? srcBody.scrollTop : 0,
-        currentMarkerId: (typeof currentMarkerId !== "undefined") ? currentMarkerId : null,
-        selected: (typeof selected !== "undefined") ? selected : null,
-        sourceMode: (typeof sourceMode !== "undefined") ? sourceMode : null,
-        occLaneFilter: (typeof occLaneFilter !== "undefined") ? occLaneFilter : null,
-        regSel: (typeof regSel !== "undefined" && regSel) ? { key: regSel.key, focusLine: regSel.focusLine, atomsKey: Array.from(regSel.atoms || []).join(",") } : null,
+        currentMarkerId: cm,
+        selected: sel,
+        sourceMode: sm,
+        occLaneFilter: lf,
+        regSel: rs,
       };
       setUiState(st);
     }, 180);
@@ -1023,6 +1044,12 @@
     regSel = { key: _saved.regSel.key, atoms: new Set(atoms), focusLine: Number(_saved.regSel.focusLine || 0) };
     regSelVersion++;
   }
+  // From here on, it is safe to render and persist state.
+  _uiReady = true;
+  if (_drawRequestedBeforeReady) {
+    _drawRequestedBeforeReady = false;
+    requestDraw();
+  }
   // user markers (vertical lines)
   let MARKERS = [];
   const MARKER_COLOR = "#ff3b30";
@@ -1165,6 +1192,7 @@
 
   let _drawPending = false;
   function requestDraw() {
+    if (!_uiReady) { _drawRequestedBeforeReady = true; return; }
     if (_drawPending) return;
     _drawPending = true;
     requestAnimationFrame(() => {
