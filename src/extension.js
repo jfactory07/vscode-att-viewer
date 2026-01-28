@@ -192,6 +192,9 @@ async function openAttImpl(context, attUri) {
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
+      // Keep the webview DOM/JS alive when switching tabs/windows,
+      // so returning to the trace preserves zoom/selection/etc.
+      retainContextWhenHidden: true,
       localResourceRoots: [
         vscode.Uri.file(cacheDir),
         vscode.Uri.file(attDir),

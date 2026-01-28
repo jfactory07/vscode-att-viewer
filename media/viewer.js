@@ -22,6 +22,33 @@
   const srcBody = document.getElementById("srcBody");
   const ctx = canvas.getContext("2d");
 
+  // webview state persistence (fallback when VS Code reloads the webview)
+  function getUiState() {
+    try { return vscode.getState() || null; } catch { return null; }
+  }
+  function setUiState(state) {
+    try { vscode.setState(state); } catch { /* ignore */ }
+  }
+  let _uiStateTimer = null;
+  function scheduleSaveUiState() {
+    if (_uiStateTimer) clearTimeout(_uiStateTimer);
+    _uiStateTimer = setTimeout(() => {
+      _uiStateTimer = null;
+      // view/currentMarkerId/selected are defined later; guard at runtime.
+      const st = {
+        view: (typeof view !== "undefined" && view) ? { min: view.min, max: view.max } : null,
+        viewportScrollTop: viewport ? viewport.scrollTop : 0,
+        srcScrollTop: srcBody ? srcBody.scrollTop : 0,
+        currentMarkerId: (typeof currentMarkerId !== "undefined") ? currentMarkerId : null,
+        selected: (typeof selected !== "undefined") ? selected : null,
+        sourceMode: (typeof sourceMode !== "undefined") ? sourceMode : null,
+        occLaneFilter: (typeof occLaneFilter !== "undefined") ? occLaneFilter : null,
+        regSel: (typeof regSel !== "undefined" && regSel) ? { key: regSel.key, focusLine: regSel.focusLine, atomsKey: Array.from(regSel.atoms || []).join(",") } : null,
+      };
+      setUiState(st);
+    }, 180);
+  }
+
   const ROW_H = 14;
   const ROW_PAD = 2;
   // leave room for the cycle axis labels so wave0 doesn't overlap
@@ -945,7 +972,13 @@
   }
   let best = null, bestN = -1;
   for (const [k, n] of markerCount.entries()) { if (n > bestN) { bestN = n; best = k; } }
-  if (best != null) requestDisasm(best);
+  // Restore current code object and selection if present
+  const _saved2 = (typeof _saved !== "undefined" && _saved) ? _saved : getUiState();
+  if (_saved2 && _saved2.currentMarkerId != null) {
+    requestDisasm(_saved2.currentMarkerId);
+  } else if (best != null) {
+    requestDisasm(best);
+  }
   // default to disasm mode for layout (no padding for virtualized table)
   if (srcBody) srcBody.classList.add("noPad");
 
@@ -975,6 +1008,21 @@
   }
 
   let view = { min: DATA.min_cycle, max: DATA.max_cycle };
+  // Restore persisted UI state (fallback). Primary fix is retainContextWhenHidden in extension host.
+  const _saved = getUiState();
+  if (_saved && _saved.view && Number.isFinite(_saved.view.min) && Number.isFinite(_saved.view.max)) {
+    view.min = _saved.view.min;
+    view.max = _saved.view.max;
+    if (view.min < DATA.min_cycle) { view.max += (DATA.min_cycle - view.min); view.min = DATA.min_cycle; }
+    if (view.max > DATA.max_cycle) { view.min -= (view.max - DATA.max_cycle); view.max = DATA.max_cycle; }
+  }
+  if (_saved && typeof _saved.occLaneFilter !== "undefined") occLaneFilter = _saved.occLaneFilter;
+  if (_saved && _saved.regSel && typeof _saved.regSel.key === "string") {
+    const atomsKey = String(_saved.regSel.atomsKey || "");
+    const atoms = atomsKey ? atomsKey.split(",").filter(Boolean) : [];
+    regSel = { key: _saved.regSel.key, atoms: new Set(atoms), focusLine: Number(_saved.regSel.focusLine || 0) };
+    regSelVersion++;
+  }
   // user markers (vertical lines)
   let MARKERS = [];
   const MARKER_COLOR = "#ff3b30";
@@ -1123,6 +1171,7 @@
       _drawPending = false;
       draw();
     });
+    scheduleSaveUiState();
   }
 
   // ---- measure range (left-drag) ----
@@ -1551,5 +1600,14 @@
 
   window.addEventListener("resize", resize);
   resize();
+
+  // Restore scroll positions after initial layout (fallback).
+  if (_saved && viewport && Number.isFinite(_saved.viewportScrollTop)) {
+    setTimeout(() => {
+      try { viewport.scrollTop = _saved.viewportScrollTop; } catch { /* ignore */ }
+      try { if (srcBody && Number.isFinite(_saved.srcScrollTop)) srcBody.scrollTop = _saved.srcScrollTop; } catch { /* ignore */ }
+      requestDraw();
+    }, 0);
+  }
 })();
 
