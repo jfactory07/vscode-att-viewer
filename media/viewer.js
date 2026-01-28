@@ -29,6 +29,8 @@
   function setUiState(state) {
     try { vscode.setState(state); } catch { /* ignore */ }
   }
+  // Read once to avoid TDZ issues with later `const` declarations.
+  const SAVED_UI_STATE = getUiState();
   // Guard against early message events before the timeline state is initialized.
   // (Using `typeof view` is unsafe due to TDZ when `view` is a later `let`.)
   let _uiReady = false;
@@ -1020,9 +1022,8 @@
   let best = null, bestN = -1;
   for (const [k, n] of markerCount.entries()) { if (n > bestN) { bestN = n; best = k; } }
   // Restore current code object and selection if present
-  const _saved2 = (typeof _saved !== "undefined" && _saved) ? _saved : getUiState();
-  if (_saved2 && _saved2.currentMarkerId != null) {
-    requestDisasm(_saved2.currentMarkerId);
+  if (SAVED_UI_STATE && SAVED_UI_STATE.currentMarkerId != null) {
+    requestDisasm(SAVED_UI_STATE.currentMarkerId);
   } else if (best != null) {
     requestDisasm(best);
   }
@@ -1056,7 +1057,7 @@
 
   let view = { min: DATA.min_cycle, max: DATA.max_cycle };
   // Restore persisted UI state (fallback). Primary fix is retainContextWhenHidden in extension host.
-  const _saved = getUiState();
+  const _saved = SAVED_UI_STATE;
   if (_saved && _saved.view && Number.isFinite(_saved.view.min) && Number.isFinite(_saved.view.max)) {
     view.min = _saved.view.min;
     view.max = _saved.view.max;
