@@ -92,7 +92,7 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
             </div>
             <div class="cfgBody" id="cfgBody"></div>
             <div class="cfgFooter">
-              <button class="btn" id="cfgReset">Reset</button>
+              <button class="btn" id="cfgReset">Reset defaults</button>
             </div>
           </div>
       </div>
@@ -117,11 +117,25 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
+  // If the shipped default palette changes, old persisted overrides can make the colors look “wrong”
+  // on machines that previously used the extension (VS Code vs Cursor have separate storages).
+  // We version the built-in palette and clear old overrides on version bump so defaults apply.
+  const PALETTE_REV = "legend-2026-01-28";
+  const prevRev = context.globalState.get("attViewer.paletteRev", null);
+  if (prevRev !== PALETTE_REV) {
+    // Clear saved color overrides so the new built-in defaults apply.
+    // Users can re-customize after upgrade.
+    context.globalState.update("attViewer.colors", undefined);
+    context.globalState.update("attViewer.paletteRev", PALETTE_REV);
+  }
+
   const openAtt = vscode.commands.registerCommand("attViewer.openAtt", async () => {
+    const lastDir = context.globalState.get("attViewer.lastDir", null);
     const pick = await vscode.window.showOpenDialog({
       canSelectMany: false,
       openLabel: "Open ATT",
       filters: { "ATT Trace": ["att"] },
+      defaultUri: lastDir ? vscode.Uri.file(String(lastDir)) : undefined,
     });
     if (!pick || pick.length === 0) return;
     await openAttImpl(context, pick[0]);
@@ -149,6 +163,8 @@ async function openAttImpl(context, attUri) {
 
   const attPath = attUri.fsPath;
   const attDir = path.dirname(attPath);
+  // Remember last opened directory for the next Open dialog.
+  await context.globalState.update("attViewer.lastDir", attDir);
 
   const resultsDb = pickResultsDb(attPath);
   if (!resultsDb) {
@@ -218,9 +234,21 @@ async function openAttImpl(context, attUri) {
   panel.webview.onDidReceiveMessage(async (msg) => {
     if (!msg || !msg.type) return;
     if (msg.type === "requestColors") {
-      panel.webview.postMessage({ type: "colors", value: getSavedColors() });
+      panel.webview.postMessage({ type: "colors", value: getSavedColors() || null });
     } else if (msg.type === "saveColors") {
-      await context.globalState.update("attViewer.colors", msg.value || null);
+      // Treat null as "clear overrides" (delete key) so defaults apply.
+      if (msg.value == null) {
+        await context.globalState.update("attViewer.colors", undefined);
+      } else {
+        await context.globalState.update("attViewer.colors", msg.value);
+      }
+      // Echo the new effective value back so the webview can synchronize UI reliably.
+      panel.webview.postMessage({ type: "colors", value: msg.value == null ? null : msg.value });
+      panel.webview.postMessage({ type: "colorsSaved" });
+    } else if (msg.type === "resetColors") {
+      // Explicit reset: remove overrides and inform the webview to revert to built-in defaults.
+      await context.globalState.update("attViewer.colors", undefined);
+      panel.webview.postMessage({ type: "colors", value: null });
       panel.webview.postMessage({ type: "colorsSaved" });
     } else if (msg.type === "requestMarkers") {
       panel.webview.postMessage({ type: "markers", value: getSavedMarkers() });

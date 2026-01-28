@@ -29,19 +29,20 @@ CAT_NAMES = {
 }
 
 DEFAULT_COLORS = {
-    "SMEM": "#6aa84f",
-    "SALU": "#ffd966",
-    "VMEM": "#e69138",
-    "FLAT": "#f6b26b",
-    "LDS": "#3c78d8",
-    "MFMA": "#ff0000",
-    "VALU": "#4b0082",
+    # Keep in sync with viewer.js built-in defaults (legend screenshot palette).
+    "SMEM": "#cad256",
+    "SALU": "#5e31c9",
+    "VMEM": "#e59138",
+    "FLAT": "#d4b18c",
+    "LDS": "#a87329",
+    "MFMA": "#114d05",
+    "VALU": "#ae74d8",
     "JUMP": "#8e7cc3",
     "NEXT": "#b4a7d6",
-    "IMMED": "#999999",
+    "IMMED": "#7f228c",
     "CONTEXT": "#76a5af",
-    "MESSAGE": "#c27ba0",
-    "BVH": "#93c47d",
+    "MESSAGE": "#b8c318",
+    "BVH": "#8eb87a",
     "NONE": "#777777",
 }
 

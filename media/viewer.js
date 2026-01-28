@@ -79,21 +79,22 @@
   const LEFT_PAD = 80;
   const GRID_STEP_PX = 120;
   // Built-in defaults (shipped with the extension). User config can override these.
-  const DEFAULT_STALL_COLOR = "#ff9aa2";
+  // NOTE: extracted from the legend screenshot (pixel-accurate).
+  const DEFAULT_STALL_COLOR = "#f90617";
   const BUILTIN_DEFAULT_COLORS = {
-    SMEM: "#6aa84f",
-    SALU: "#ffd966",
-    VMEM: "#e69138",
-    FLAT: "#f6b26b",
-    LDS: "#3c78d8",
-    MFMA: "#ff0000",
-    VALU: "#4b0082",
+    SMEM: "#cad256",
+    SALU: "#5e31c9",
+    VMEM: "#e59138",
+    FLAT: "#d4b18c",
+    LDS: "#a87329",
+    MFMA: "#114d05",
+    VALU: "#ae74d8",
     JUMP: "#8e7cc3",
     NEXT: "#b4a7d6",
-    IMMED: "#999999",
+    IMMED: "#7f228c",
     CONTEXT: "#76a5af",
-    MESSAGE: "#c27ba0",
-    BVH: "#93c47d",
+    MESSAGE: "#b8c318",
+    BVH: "#8eb87a",
     NONE: "#777777",
   };
 
@@ -141,8 +142,9 @@
   hideLoading();
 
   // Mutable colors map (category -> color hex).
-  // Start from built-in defaults, then merge any trace-provided colors.
-  let COLORS = { ...BUILTIN_DEFAULT_COLORS, ...(DATA.colors || {}) };
+  // IMPORTANT: use built-in defaults as the baseline, regardless of any cached trace JSON.
+  // (Older cached JSON files may contain outdated colors.)
+  let COLORS = { ...BUILTIN_DEFAULT_COLORS };
   const CAT_NAMES = DATA.cat_names;
 
   const lanes = DATA.lanes;
@@ -258,7 +260,9 @@
     buildCfgUI();
     renderLegend();
     requestDraw();
-    saveColors();
+    // Ask the extension host to atomically reset persisted overrides to defaults.
+    // This avoids message ordering races between saveColors/requestColors.
+    vscode.postMessage({ type: "resetColors" });
   }
 
   if (cfgReset) cfgReset.addEventListener("click", resetColors);
@@ -268,10 +272,16 @@
   window.addEventListener("message", (event) => {
     const msg = event.data;
     if (!msg || !msg.type) return;
-    if (msg.type === "colors" && msg.value) {
-      const v = msg.value;
-      if (v.colors && typeof v.colors === "object") COLORS = { ...COLORS, ...v.colors };
-      if (typeof v.stallColor === "string") stallColor = v.stallColor;
+    if (msg.type === "colors") {
+      // If value is null/empty, treat as "no overrides" and revert to built-in defaults.
+      if (!msg.value) {
+        COLORS = { ...BUILTIN_DEFAULT_COLORS };
+        stallColor = DEFAULT_STALL_COLOR;
+      } else {
+        const v = msg.value;
+        if (v.colors && typeof v.colors === "object") COLORS = { ...COLORS, ...v.colors };
+        if (typeof v.stallColor === "string") stallColor = v.stallColor;
+      }
       buildCfgUI();
       renderLegend();
       requestDraw();
