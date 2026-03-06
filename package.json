@@ -68,7 +68,7 @@
         "attViewer.maxEvents": {
           "type": "number",
           "default": 0,
-          "description": "Cap decoded instruction events (0 = all). Use this to speed up large traces."
+          "description": "Cap decoded instruction events (0 = all, with automatic safety cap on very large traces). Use this to speed up large traces."
         }
       }
     }

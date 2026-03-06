@@ -48,6 +48,16 @@ function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
 }
 
+function toMB(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+const AUTO_CAP_ATT_BYTES = 64 * 1024 * 1024;
+const WEBVIEW_JSON_SOFT_LIMIT_BYTES = 48 * 1024 * 1024;
+const AUTO_MAX_EVENTS_DEFAULT = 250000;
+const AUTO_MAX_EVENTS_MIN = 50000;
+const AUTO_MAX_EVENTS_MAX = 500000;
+
 function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
   const scriptUri = webview.asWebviewUri(
     vscode.Uri.joinPath(ctx.extensionUri, "media", "viewer.js")
@@ -163,6 +173,9 @@ async function openAttImpl(context, attUri) {
 
   const attPath = attUri.fsPath;
   const attDir = path.dirname(attPath);
+  const attSizeBytes = (() => {
+    try { return fs.statSync(attPath).size; } catch { return 0; }
+  })();
   // Remember last opened directory for the next Open dialog.
   await context.globalState.update("attViewer.lastDir", attDir);
 
@@ -188,6 +201,13 @@ async function openAttImpl(context, attUri) {
   // Ensure ROCm libs can be found
   env.LD_LIBRARY_PATH = ["/opt/rocm/lib", env.LD_LIBRARY_PATH || ""].filter(Boolean).join(":");
 
+  let effectiveMaxEvents = maxEvents;
+  let autoCapReason = "";
+  if (effectiveMaxEvents <= 0 && attSizeBytes >= AUTO_CAP_ATT_BYTES) {
+    effectiveMaxEvents = AUTO_MAX_EVENTS_DEFAULT;
+    autoCapReason = `large ATT (${toMB(attSizeBytes)} MB)`;
+  }
+
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: "ATT Viewer: decoding…", cancellable: false },
     async () => {
@@ -197,10 +217,52 @@ async function openAttImpl(context, attUri) {
         codeobjDir: attDir,
         gpuArch,
         out: outJson,
-        maxEvents,
+        maxEvents: effectiveMaxEvents,
       }, env);
     }
   );
+
+  if (maxEvents <= 0) {
+    const outSizeBytes = (() => {
+      try { return fs.statSync(outJson).size; } catch { return 0; }
+    })();
+    if (outSizeBytes > WEBVIEW_JSON_SOFT_LIMIT_BYTES) {
+      const estimate = effectiveMaxEvents > 0
+        ? Math.floor((effectiveMaxEvents * WEBVIEW_JSON_SOFT_LIMIT_BYTES) / outSizeBytes)
+        : AUTO_MAX_EVENTS_DEFAULT;
+      const reducedMaxEvents = Math.max(
+        AUTO_MAX_EVENTS_MIN,
+        Math.min(AUTO_MAX_EVENTS_MAX, estimate)
+      );
+      if (effectiveMaxEvents <= 0 || reducedMaxEvents < effectiveMaxEvents) {
+        effectiveMaxEvents = reducedMaxEvents;
+        autoCapReason = autoCapReason || `large decoded JSON (${toMB(outSizeBytes)} MB)`;
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `ATT Viewer: reducing events to ${effectiveMaxEvents.toLocaleString()} for webview stability…`,
+            cancellable: false,
+          },
+          async () => {
+            await runPython(pythonPath, pyScript, {
+              att: attPath,
+              resultsDb,
+              codeobjDir: attDir,
+              gpuArch,
+              out: outJson,
+              maxEvents: effectiveMaxEvents,
+            }, env);
+          }
+        );
+      }
+    }
+  }
+
+  if (maxEvents <= 0 && effectiveMaxEvents > 0) {
+    vscode.window.showInformationMessage(
+      `ATT Viewer: auto-limited to ${effectiveMaxEvents.toLocaleString()} events (${autoCapReason || "very large trace"}). Set attViewer.maxEvents to override.`
+    );
+  }
 
   const panel = vscode.window.createWebviewPanel(
     "attViewer",
