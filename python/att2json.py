@@ -124,6 +124,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--decoder-lib-path", type=Path, default=Path("/opt/rocm/lib"))
     ap.add_argument("--rocprofiler-sdk", type=Path, default=Path("/opt/rocm/lib/librocprofiler-sdk.so"))
+    ap.add_argument("--llvm-objdump", type=Path, default=Path("/opt/rocm/llvm/bin/llvm-objdump"))
     ap.add_argument("--max-events", type=int, default=0)
     args = ap.parse_args()
 
@@ -158,7 +159,7 @@ def main() -> None:
         pcs = pcs_by_id.get(cid, [])
         if not pcs:
             continue
-        dis = batch_disasm_lookup(codeobj_path=path, gpu_arch=args.gpu_arch, addrs=pcs)
+        dis = batch_disasm_lookup(codeobj_path=path, gpu_arch=args.gpu_arch, addrs=pcs, llvm_objdump=args.llvm_objdump)
         for pc, text in dis.items():
             asm_map[(cid, pc)] = text
 

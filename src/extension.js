@@ -35,6 +35,16 @@ function pickResultsDb(attPath) {
   return null;
 }
 
+async function promptForFile(cfg, settingKey, notFoundMsg, openLabel) {
+  const choice = await vscode.window.showErrorMessage(notFoundMsg, "Browse…", "Cancel");
+  if (choice !== "Browse…") return null;
+  const picked = await vscode.window.showOpenDialog({ canSelectMany: false, openLabel });
+  if (!picked || picked.length === 0) return null;
+  const newPath = picked[0].fsPath;
+  await cfg.update(settingKey, newPath, vscode.ConfigurationTarget.Global);
+  return newPath;
+}
+
 function inferGpuArchFromDir(dir) {
   const cands = listFiles(dir).filter((p) => p.includes("_code_object_id_") && p.endsWith(".out"));
   for (const p of cands) {
@@ -170,6 +180,27 @@ async function openAttImpl(context, attUri) {
   const cfg = vscode.workspace.getConfiguration("attViewer");
   const pythonPath = cfg.get("pythonPath", "python3");
   const maxEvents = Number(cfg.get("maxEvents", 0)) || 0;
+  let rocprofilerSdkPath = cfg.get("rocprofilerSdkPath", "/opt/rocm/lib/librocprofiler-sdk.so");
+  if (!fileExists(rocprofilerSdkPath)) {
+    const resolved = await promptForFile(
+      cfg, "rocprofilerSdkPath",
+      `ATT Viewer: librocprofiler-sdk.so not found at "${rocprofilerSdkPath}". Please locate it.`,
+      "Select librocprofiler-sdk.so"
+    );
+    if (!resolved) return;
+    rocprofilerSdkPath = resolved;
+  }
+
+  let llvmObjdumpPath = cfg.get("llvmObjdumpPath", "/opt/rocm/llvm/bin/llvm-objdump");
+  if (!fileExists(llvmObjdumpPath)) {
+    const resolved = await promptForFile(
+      cfg, "llvmObjdumpPath",
+      `ATT Viewer: llvm-objdump not found at "${llvmObjdumpPath}". Please locate it.`,
+      "Select llvm-objdump"
+    );
+    if (!resolved) return;
+    llvmObjdumpPath = resolved;
+  }
 
   const attPath = attUri.fsPath;
   const attDir = path.dirname(attPath);
@@ -198,8 +229,9 @@ async function openAttImpl(context, attUri) {
 
   const pyScript = vscode.Uri.joinPath(context.extensionUri, "python", "att2json.py").fsPath;
   const env = { ...process.env };
-  // Ensure ROCm libs can be found
-  env.LD_LIBRARY_PATH = ["/opt/rocm/lib", env.LD_LIBRARY_PATH || ""].filter(Boolean).join(":");
+  // Ensure ROCm libs can be found alongside librocprofiler-sdk.so
+  const rocmLibDir = path.dirname(rocprofilerSdkPath);
+  env.LD_LIBRARY_PATH = [rocmLibDir, env.LD_LIBRARY_PATH || ""].filter(Boolean).join(":");
 
   let effectiveMaxEvents = maxEvents;
   let autoCapReason = "";
@@ -218,6 +250,8 @@ async function openAttImpl(context, attUri) {
         gpuArch,
         out: outJson,
         maxEvents: effectiveMaxEvents,
+        rocprofilerSdkPath,
+        llvmObjdumpPath,
       }, env);
     }
   );
@@ -333,7 +367,7 @@ async function openAttImpl(context, attUri) {
         return;
       }
       try {
-        const lines = await runObjdump(gpuArch, codeobjPath);
+        const lines = await runObjdump(gpuArch, codeobjPath, llvmObjdumpPath);
         disasmCache.set(key, lines);
         panel.webview.postMessage({
           type: "disasm",
@@ -363,9 +397,8 @@ async function openAttImpl(context, attUri) {
   }
 }
 
-function runObjdump(gpuArch, codeobjPath) {
+function runObjdump(gpuArch, codeobjPath, objdump = "/opt/rocm/llvm/bin/llvm-objdump") {
   return new Promise((resolve, reject) => {
-    const objdump = "/opt/rocm/llvm/bin/llvm-objdump";
     const args = ["-d", `--mcpu=${gpuArch}`, codeobjPath];
     const p = spawn(objdump, args, { env: process.env });
     let out = "";
@@ -410,6 +443,13 @@ function runPython(pythonExe, scriptPath, args, env) {
     }
     if (args.maxEvents && args.maxEvents > 0) {
       argv.push("--max-events", String(args.maxEvents));
+    }
+    if (args.rocprofilerSdkPath) {
+      argv.push("--rocprofiler-sdk", args.rocprofilerSdkPath);
+      argv.push("--decoder-lib-path", path.dirname(args.rocprofilerSdkPath));
+    }
+    if (args.llvmObjdumpPath) {
+      argv.push("--llvm-objdump", args.llvmObjdumpPath);
     }
 
     const p = spawn(pythonExe, argv, { env });
