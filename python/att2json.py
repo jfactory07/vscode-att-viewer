@@ -120,7 +120,6 @@ def main() -> None:
     ap.add_argument("--att", required=True, type=Path)
     ap.add_argument("--results-db", required=False, type=Path)
     ap.add_argument("--codeobj-dir", required=True, type=Path)
-    ap.add_argument("--gpu-arch", required=True)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--decoder-lib-path", type=Path, default=Path("/opt/rocm/lib"))
     ap.add_argument("--rocprofiler-sdk", type=Path, default=Path("/opt/rocm/lib/librocprofiler-sdk.so"))
@@ -159,7 +158,7 @@ def main() -> None:
         pcs = pcs_by_id.get(cid, [])
         if not pcs:
             continue
-        dis = batch_disasm_lookup(codeobj_path=path, gpu_arch=args.gpu_arch, addrs=pcs, llvm_objdump=args.llvm_objdump)
+        dis = batch_disasm_lookup(codeobj_path=path, addrs=pcs, llvm_objdump=args.llvm_objdump)
         for pc, text in dis.items():
             asm_map[(cid, pc)] = text
 
@@ -201,7 +200,6 @@ def main() -> None:
             "gfxip_major": gfxip,
             "att": str(args.att),
             "results_db": str(args.results_db) if args.results_db else "",
-            "gpu_arch": args.gpu_arch,
             "codeobj_files": {str(cid): str(p) for (cid, _base, _size, p) in codeobjs},
         },
     }
