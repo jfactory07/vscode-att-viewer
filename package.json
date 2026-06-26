@@ -29,10 +29,19 @@
   ],
   "main": "./src/extension.js",
   "activationEvents": [
+    "onCustomEditor:attViewer.attEditor",
     "onCommand:attViewer.openAtt",
     "onCommand:attViewer.openAttFromUri"
   ],
   "contributes": {
+    "customEditors": [
+      {
+        "viewType": "attViewer.attEditor",
+        "displayName": "ATT Trace Viewer",
+        "selector": [{ "filenamePattern": "*.att" }],
+        "priority": "default"
+      }
+    ],
     "commands": [
       {
         "command": "attViewer.openAtt",
