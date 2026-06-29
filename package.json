@@ -69,6 +69,16 @@
           "type": "number",
           "default": 0,
           "description": "Cap decoded instruction events (0 = all, with automatic safety cap on very large traces). Use this to speed up large traces."
+        },
+        "attViewer.rocprofilerSdkPath": {
+          "type": "string",
+          "default": "/opt/rocm/lib/librocprofiler-sdk.so",
+          "description": "Path to librocprofiler-sdk.so used for ATT decoding"
+        },
+        "attViewer.llvmObjdumpPath": {
+          "type": "string",
+          "default": "/opt/rocm/llvm/bin/llvm-objdump",
+          "description": "Path to llvm-objdump used for disassembly in the source panel"
         }
       }
     }
