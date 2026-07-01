@@ -169,14 +169,41 @@ function activate(context) {
     }
   );
 
-  context.subscriptions.push(openAtt, openAttFromUri);
+  const customEditorProvider = {
+    openCustomDocument(uri) {
+      return { uri, dispose() {} };
+    },
+    async resolveCustomEditor(document, webviewPanel, _token) {
+      // Always set webview options first so VS Code has a valid panel regardless of what happens next.
+      webviewPanel.webview.options = { enableScripts: true };
+      try {
+        await openAttImpl(context, document.uri, webviewPanel);
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        webviewPanel.webview.html = `<!doctype html><html><body style="color:var(--vscode-foreground);font-family:sans-serif;padding:2em">
+          <h3>ATT Viewer: failed to open trace</h3><pre style="white-space:pre-wrap">${msg}</pre></body></html>`;
+        vscode.window.showErrorMessage(`ATT Viewer: ${msg}`);
+      }
+    },
+  };
+
+  context.subscriptions.push(
+    openAtt,
+    openAttFromUri,
+    vscode.window.registerCustomEditorProvider(
+      "attViewer.attEditor",
+      customEditorProvider,
+      { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: false }
+    )
+  );
 }
 
 /**
  * @param {vscode.ExtensionContext} context
  * @param {vscode.Uri} attUri
+ * @param {vscode.WebviewPanel} [existingPanel]
  */
-async function openAttImpl(context, attUri) {
+async function openAttImpl(context, attUri, existingPanel = null) {
   const cfg = vscode.workspace.getConfiguration("attViewer");
   const pythonPath = cfg.get("pythonPath", "python3");
   const maxEvents = Number(cfg.get("maxEvents", 0)) || 0;
@@ -298,23 +325,24 @@ async function openAttImpl(context, attUri) {
     );
   }
 
-  const panel = vscode.window.createWebviewPanel(
-    "attViewer",
-    `ATT: ${path.basename(attPath)}`,
-    vscode.ViewColumn.Active,
-    {
-      enableScripts: true,
-      // Keep the webview DOM/JS alive when switching tabs/windows,
-      // so returning to the trace preserves zoom/selection/etc.
-      retainContextWhenHidden: true,
-      localResourceRoots: [
-        vscode.Uri.file(cacheDir),
-        vscode.Uri.file(attDir),
-        vscode.Uri.joinPath(context.extensionUri, "media"),
-        vscode.Uri.joinPath(context.extensionUri, "python"),
-      ],
-    }
-  );
+  const localResourceRoots = [
+    vscode.Uri.file(cacheDir),
+    vscode.Uri.file(attDir),
+    vscode.Uri.joinPath(context.extensionUri, "media"),
+    vscode.Uri.joinPath(context.extensionUri, "python"),
+  ];
+  let panel;
+  if (existingPanel) {
+    existingPanel.webview.options = { enableScripts: true, localResourceRoots };
+    panel = existingPanel;
+  } else {
+    panel = vscode.window.createWebviewPanel(
+      "attViewer",
+      `ATT: ${path.basename(attPath)}`,
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots }
+    );
+  }
 
   const jsonUri = panel.webview.asWebviewUri(vscode.Uri.file(outJson));
   const traceKey = sha1(attPath);
