@@ -10,12 +10,11 @@ _ADDR_RE = re.compile(r"//\s+([0-9A-Fa-f]+):")
 
 def disassemble_to_map(
     codeobj_path: Path,
-    gpu_arch: str,
     llvm_objdump: Path = Path("/opt/rocm/llvm/bin/llvm-objdump"),
     start: Optional[int] = None,
     stop: Optional[int] = None,
 ) -> Dict[int, str]:
-    cmd = [str(llvm_objdump), "-d", f"--mcpu={gpu_arch}"]
+    cmd = [str(llvm_objdump), "-d"]
     if start is not None:
         cmd += [f"--start-address=0x{start:x}"]
     if stop is not None:
@@ -40,7 +39,6 @@ def disassemble_to_map(
 
 def batch_disasm_lookup(
     codeobj_path: Path,
-    gpu_arch: str,
     addrs: Iterable[int],
     llvm_objdump: Path = Path("/opt/rocm/llvm/bin/llvm-objdump"),
 ) -> Dict[int, str]:
@@ -51,7 +49,6 @@ def batch_disasm_lookup(
     stop = addrs[-1] + 0x400
     m = disassemble_to_map(
         codeobj_path=codeobj_path,
-        gpu_arch=gpu_arch,
         llvm_objdump=llvm_objdump,
         start=start,
         stop=stop,

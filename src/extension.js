@@ -44,16 +44,6 @@ async function promptForFile(cfg, settingKey, notFoundMsg, openLabel) {
   await cfg.update(settingKey, newPath, vscode.ConfigurationTarget.Global);
   return newPath;
 }
-
-function inferGpuArchFromDir(dir) {
-  const cands = listFiles(dir).filter((p) => p.includes("_code_object_id_") && p.endsWith(".out"));
-  for (const p of cands) {
-    const m = p.match(/_gfx(\d+)_code_object_id_/);
-    if (m) return `gfx${m[1]}`;
-  }
-  return null;
-}
-
 function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
 }
@@ -244,9 +234,6 @@ async function openAttImpl(context, attUri, existingPanel = null) {
     );
   }
 
-  const inferredArch = inferGpuArchFromDir(attDir);
-  const gpuArch = cfg.get("gpuArch", inferredArch || "gfx950") || inferredArch || "gfx950";
-
   const cacheDir = context.globalStorageUri.fsPath;
   fs.mkdirSync(cacheDir, { recursive: true });
   const outJson = path.join(
@@ -274,7 +261,6 @@ async function openAttImpl(context, attUri, existingPanel = null) {
         att: attPath,
         resultsDb,
         codeobjDir: attDir,
-        gpuArch,
         out: outJson,
         maxEvents: effectiveMaxEvents,
         rocprofilerSdkPath,
@@ -349,7 +335,7 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   panel.webview.html = getWebviewHtml(panel.webview, context, jsonUri, traceKey);
 
   // In-panel disassembly cache
-  const disasmCache = new Map(); // key: gpuArch|path -> lines
+  const disasmCache = new Map();
 
   // Persisted color config (global across traces)
   const getSavedColors = () => context.globalState.get("attViewer.colors", null);
@@ -381,22 +367,20 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       await context.globalState.update(`attViewer.markers.${traceKey}`, arr);
       panel.webview.postMessage({ type: "markersSaved" });
     } else if (msg.type === "requestDisasm") {
-      const gpuArch = msg.gpuArch;
       const codeobjPath = msg.codeobjPath;
-      if (!gpuArch || !codeobjPath) return;
-      const key = `${gpuArch}|${codeobjPath}`;
-      if (disasmCache.has(key)) {
+      if (!codeobjPath) return;
+      if (disasmCache.has(codeobjPath)) {
         panel.webview.postMessage({
           type: "disasm",
           markerId: msg.markerId,
           codeobjPath,
-          lines: disasmCache.get(key),
+          lines: disasmCache.get(codeobjPath),
         });
         return;
       }
       try {
-        const lines = await runObjdump(gpuArch, codeobjPath, llvmObjdumpPath);
-        disasmCache.set(key, lines);
+        const lines = await runObjdump(llvmObjdumpPath, codeobjPath);
+        disasmCache.set(codeobjPath, lines);
         panel.webview.postMessage({
           type: "disasm",
           markerId: msg.markerId,
@@ -425,9 +409,9 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   }
 }
 
-function runObjdump(gpuArch, codeobjPath, objdump = "/opt/rocm/llvm/bin/llvm-objdump") {
+function runObjdump(objdump, codeobjPath) {
   return new Promise((resolve, reject) => {
-    const args = ["-d", `--mcpu=${gpuArch}`, codeobjPath];
+    const args = ["-d", codeobjPath];
     const p = spawn(objdump, args, { env: process.env });
     let out = "";
     let err = "";
@@ -461,8 +445,6 @@ function runPython(pythonExe, scriptPath, args, env) {
       args.att,
       "--codeobj-dir",
       args.codeobjDir,
-      "--gpu-arch",
-      args.gpuArch,
       "--out",
       args.out,
     ];

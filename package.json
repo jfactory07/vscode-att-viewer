@@ -69,11 +69,6 @@
           "default": "python3",
           "description": "Python executable to run the offline ATT decoder"
         },
-        "attViewer.gpuArch": {
-          "type": "string",
-          "default": "gfx950",
-          "description": "GPU arch passed to llvm-objdump (e.g. gfx950, gfx942)"
-        },
         "attViewer.maxEvents": {
           "type": "number",
           "default": 0,
