@@ -57,7 +57,14 @@ def _is_mfma_valu(asm: str) -> bool:
     # common patterns from llvm-objdump:
     #   v_mfma_f32_...
     #   v_wmma_...
-    return a.startswith("v_mfma") or a.startswith("v_wmma") or ("_mfma" in a)
+    #   v_smfmac_f32_...  (sparse MFMA; note "smfmac" does NOT contain "_mfma")
+    return (
+        a.startswith("v_mfma")
+        or a.startswith("v_wmma")
+        or a.startswith("v_smfmac")
+        or ("_mfma" in a)
+        or ("smfmac" in a)
+    )
 
 
 def _read_codeobj_table(results_db: Path) -> List[Tuple[int, int, int]]:
