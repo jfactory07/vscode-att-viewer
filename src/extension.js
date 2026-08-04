@@ -366,6 +366,9 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       const arr = Array.isArray(msg.value) ? msg.value : [];
       await context.globalState.update(`attViewer.markers.${traceKey}`, arr);
       panel.webview.postMessage({ type: "markersSaved" });
+    } else if (msg.type === "copyText") {
+      // fallback path: the webview could not reach the browser clipboard itself
+      await vscode.env.clipboard.writeText(String(msg.text || ""));
     } else if (msg.type === "requestDisasm") {
       const codeobjPath = msg.codeobjPath;
       if (!codeobjPath) return;

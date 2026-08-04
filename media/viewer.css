@@ -29,6 +29,7 @@ html, body {
 .sourceHeader { display: flex; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid rgba(255,255,255,0.08); border-bottom: 1px solid rgba(255,255,255,0.08); color: rgba(255,255,255,0.8); font-size: 12px; }
 .sourceBody { overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.4; padding: 10px; }
 .sourceBody.noPad { padding: 0; }
+.sourceBody:focus { outline: none; }
 .srcTabs { margin-left: auto; display: flex; gap: 6px; }
 .tabBtn {
   background: rgba(255,255,255,0.06);
@@ -101,7 +102,10 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  user-select: text;
 }
+/* while dragging a row range, suppress native text selection */
+.disContainer.dragging .disCell { user-select: none; }
 .disAddrCell { color: rgba(255,255,255,0.55); }
 .disTextCell { color: rgba(255,255,255,0.92); }
 .disNumCell { text-align: right; color: rgba(255,255,255,0.78); }
@@ -144,7 +148,45 @@ html, body {
 .disLayer { position: absolute; left: 0; right: 0; top: 0; }
 .disDataRow { cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .disDataRow:hover { background: rgba(255,255,255,0.06); }
+/* copy range first, so the currently inspected instruction still wins the highlight */
+.disDataRow.rangeSel { background: rgba(64, 132, 235, 0.30); }
 .disDataRow.selected { background: rgba(255,255,255,0.16); outline: 1px solid rgba(255,255,255,0.22); }
+.disMenu {
+  position: fixed;
+  z-index: 40;
+  min-width: 200px;
+  padding: 4px;
+  background: #26282c;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.45);
+  font-size: 12px;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.disMenuItem {
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: rgba(255,255,255,0.88);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.disMenuItem:hover { background: rgba(255,255,255,0.12); }
+.disMenuSep { height: 1px; margin: 4px 6px; background: rgba(255,255,255,0.12); }
+.copyToast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: rgba(0,0,0,0.82);
+  border: 1px solid rgba(255,255,255,0.16);
+  color: rgba(255,255,255,0.92);
+  font-size: 12px;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+  display: none;
+}
 canvas { display: block; background: #17181b; }
 .tooltip {
   position: absolute;

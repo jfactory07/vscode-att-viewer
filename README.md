@@ -84,6 +84,10 @@ Disassembly:
 
 - Click a register token (e.g. `v78`, `v[98:101]`, `s61`) to highlight matching registers in nearby lines
 - Select `s_waitcnt lgkmcnt(N)` / `vmcnt(N)` to show a polyline arrow to the corresponding previous memory op
+- Click or drag rows to select lines, Shift + click to extend, Ctrl/Cmd + A to select all, Esc to clear
+- Ctrl/Cmd + C (or the `Copy` button) copies the selected lines as `addr  instruction`
+- Right-click the listing for other copy formats (instruction text only, or TSV with per-wave counts)
+- Dragging inside a single line still makes a normal text selection, so partial copies work too
 
 ## Troubleshooting
 

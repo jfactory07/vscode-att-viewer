@@ -4,6 +4,23 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Fix a crash in the Occurrences pane when the lane filter selects a wave on which the
+  instruction never issued (`Cannot read properties of undefined (reading 'asm')`); the pane
+  now keeps the instruction header and explains that the lane has no occurrences
+- Select and copy assembly out of the disassembly panel: click/drag rows or Shift+click to
+  extend a line range, Ctrl/Cmd+A to take all lines, Ctrl/Cmd+C or the new `Copy` button to
+  copy, and a right-click menu for instruction-only text or TSV with per-wave counts. The
+  text is rebuilt from the decoded listing, so rows scrolled out of the virtualized grid are
+  copied correctly.
+- Draw wait-like instructions (`s_wait_*`, `s_barrier_wait`) as a full-width bar over their
+  whole stall span instead of a 1-pixel sliver plus a stall line
+- Fix long events starting left of the viewport being culled from the timeline
+- Resolve wait target arrows on gfx12+, where `s_waitcnt` was split into per-counter waits
+  (`s_wait_dscnt`, `s_wait_loadcnt`, `s_wait_storecnt`, `s_wait_kmcnt`, `s_wait_tensorcnt`,
+  `s_wait_asynccnt`, `s_wait_xcnt` and the combined `s_wait_{load,store}cnt_dscnt`), and
+  match the renamed DS ops (`ds_load`/`ds_store`) as well as `global_`/`flat_`/`scratch_`
+  and `tensor_` producers
+
 ## 0.0.33
 
 - Timeline viewer with category coloring and tooltips

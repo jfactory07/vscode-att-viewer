@@ -152,6 +152,11 @@
   for (let i = 0; i < lanes; i++) eventsByLane.push([]);
   for (const e of DATA.events) eventsByLane[e.lane].push(e);
   for (const lane of eventsByLane) lane.sort((a, b) => a.issue - b.issue);
+  // Longest event per lane, so drawEvents can rewind far enough to catch events that
+  // start left of the viewport but still extend into it.
+  const maxSpanByLane = eventsByLane.map((evs) =>
+    evs.reduce((m, e) => Math.max(m, e.duration || 1), 1)
+  );
 
   // index: marker|pc -> stats + list of event refs
   // stats include per-lane counts and dominant category for coloring disasm
@@ -307,9 +312,14 @@
   let regSelVersion = 0;
   const REG_HL_FORWARD_LINES = 200;
   // waitcnt target arrows (derived from disasm text)
-  let waitSel = null; // { fromLine:number, targets:Array<{type:"lgkm"|"vm", n:number, line:number, pc:number}> }
+  let waitSel = null; // { fromLine:number, targets:Array<{type:string, cls:"lgkm"|"vm", label:string, n:number, line:number, pc:number}> }
   let waitSelVersion = 0;
   const WAIT_SCAN_BACK_LIMIT = 4096;
+  // disasm row-range selection, used for copying assembly text out of the panel.
+  // The grid is virtualized, so the range lives in line indices and the copied text is
+  // rebuilt from `disasmLines` rather than scraped from the DOM.
+  let disRange = null; // { a:number, b:number } inclusive, unordered
+  let disRangeVersion = 0;
 
   function escapeHtml(s) {
     return String(s)
@@ -390,36 +400,149 @@
     return out || escapeHtml(s);
   }
 
-  function parseWaitcnt(text) {
-    const s = String(text || "").trim();
-    if (!s) return null;
-    const mnem = s.split(/\s+/)[0] || "";
-    if (mnem !== "s_waitcnt") return null;
-    const lgkmM = s.match(/lgkmcnt\((\d+)\)/);
-    const vmM = s.match(/vmcnt\((\d+)\)/);
-    const lgkm = lgkmM ? Number(lgkmM[1]) : null;
-    const vm = vmM ? Number(vmM[1]) : null;
-    if (lgkm == null && vm == null) return null;
-    return {
-      lgkm: Number.isFinite(lgkm) ? lgkm : null,
-      vm: Number.isFinite(vm) ? vm : null
-    };
-  }
-
   function mnemOfLineText(text) {
     const s = String(text || "").trim();
     if (!s) return "";
     return (s.split(/\s+/)[0] || "").trim();
   }
 
-  function isDsReadWrite(text) {
-    const m = mnemOfLineText(text);
-    return /^ds_(read|write)/.test(m);
+  // Producer predicates, one per hardware counter. gfx12 renamed the DS ops
+  // (ds_read/ds_write -> ds_load/ds_store) and split the old vmcnt/lgkmcnt pair
+  // into one counter per traffic class, so both spellings are matched here.
+  function isDsOp(text) {
+    // DS_CNT (LGKM_CNT's LDS half pre-gfx12): any LDS/GDS access.
+    return /^ds_/.test(mnemOfLineText(text));
+  }
+  function isAsyncLdsCopy(text) {
+    // ASYNC_CNT (gfx1250): asynchronous global <-> LDS copies.
+    return /_async/.test(mnemOfLineText(text));
+  }
+  function isTensorOp(text) {
+    // TENSOR_CNT (gfx1250): tensor_load_to_lds / tensor_store_from_lds.
+    return /^tensor_/.test(mnemOfLineText(text));
+  }
+  function isVmemLoad(text) {
+    if (isAsyncLdsCopy(text)) return false;
+    return /^(global|buffer|flat|scratch|image)_load/.test(mnemOfLineText(text));
+  }
+  function isVmemStore(text) {
+    if (isAsyncLdsCopy(text)) return false;
+    // A non-returning atomic retires on STORE_CNT. A returning one retires on
+    // LOAD_CNT instead, which the mnemonic alone does not distinguish, so
+    // atomics are attributed to STORE_CNT (the common case in compute code).
+    return /^(global|buffer|flat|scratch|image)_(store|atomic)/.test(mnemOfLineText(text));
+  }
+  function isVmemOp(text) {
+    return isVmemLoad(text) || isVmemStore(text);
+  }
+  function isSmemLoad(text) {
+    return /^s_(load|buffer_load)/.test(mnemOfLineText(text));
+  }
+  function isKmOp(text) {
+    // KM_CNT (LGKM_CNT's scalar half pre-gfx12): scalar reads and messages.
+    return isSmemLoad(text) || /^s_sendmsg/.test(mnemOfLineText(text));
+  }
+  function isExpOp(text) {
+    return /^(exp|lds_direct_load|lds_param_load)/.test(mnemOfLineText(text));
+  }
+  function isImageSample(text) {
+    return /^image_(sample|gather)/.test(mnemOfLineText(text));
+  }
+  function isImageBvh(text) {
+    return /^image_bvh/.test(mnemOfLineText(text));
+  }
+  function isLgkmOp(text) {
+    // Pre-gfx12 LGKM_CNT lumps LDS, scalar memory and messages into one counter.
+    return isDsOp(text) || isKmOp(text);
+  }
+  function isXcntOp(text) {
+    // X_CNT (gfx1250) counts memory ops that have not finished address
+    // translation: VMEM and SMEM. LDS never leaves the WGP, so it is excluded.
+    return isVmemOp(text) || isSmemLoad(text);
   }
 
-  function isBufferLoad(text) {
-    const m = mnemOfLineText(text);
-    return /^buffer_load/.test(m);
+  // `cls` selects one of the two row/badge highlight styles; `label` is the
+  // badge text.
+  const WAIT_COUNTERS = {
+    ds: { label: "DS", cls: "lgkm", match: isDsOp },
+    lgkm: { label: "LGKM", cls: "lgkm", match: isLgkmOp },
+    km: { label: "KM", cls: "lgkm", match: isKmOp },
+    load: { label: "LOAD", cls: "vm", match: isVmemLoad },
+    store: { label: "STORE", cls: "vm", match: isVmemStore },
+    vm: { label: "VM", cls: "vm", match: isVmemOp },
+    tensor: { label: "TENSOR", cls: "vm", match: isTensorOp },
+    async: { label: "ASYNC", cls: "vm", match: isAsyncLdsCopy },
+    exp: { label: "EXP", cls: "vm", match: isExpOp },
+    sample: { label: "SAMPLE", cls: "vm", match: isImageSample },
+    bvh: { label: "BVH", cls: "vm", match: isImageBvh },
+    x: { label: "X", cls: "vm", match: isXcntOp }
+  };
+
+  // gfx12+ per-counter waits. The operand is a bare immediate ("s_wait_dscnt
+  // 0x2"), not the gfx9-style vmcnt(N)/lgkmcnt(N) list.
+  const SINGLE_WAIT_COUNTER = {
+    s_wait_loadcnt: "load",
+    s_wait_storecnt: "store",
+    s_wait_dscnt: "ds",
+    s_wait_kmcnt: "km",
+    s_wait_expcnt: "exp",
+    s_wait_samplecnt: "sample",
+    s_wait_bvhcnt: "bvh",
+    s_wait_tensorcnt: "tensor",
+    s_wait_asynccnt: "async",
+    s_wait_xcnt: "x"
+  };
+  // The gfx12+ combined waits pack two counters into simm16: bits 15:8 hold the
+  // load/store count and bits 7:0 the DS count (LLVM encodeLoadcntDscnt).
+  const COMBINED_WAIT_COUNTERS = {
+    s_wait_loadcnt_dscnt: ["load", "ds"],
+    s_wait_storecnt_dscnt: ["store", "ds"]
+  };
+  // Counters are at most 6 bits wide; a larger immediate is a "do not wait"
+  // encoding (e.g. 0xffff) with no instruction to point at.
+  const WAIT_MAX_N = 63;
+
+  function parseImmOperand(text) {
+    const m = String(text || "").trim().match(/^(0x[0-9a-fA-F]+|\d+)/);
+    if (!m) return null;
+    const v = /^0x/i.test(m[1]) ? parseInt(m[1], 16) : parseInt(m[1], 10);
+    return Number.isFinite(v) ? v : null;
+  }
+
+  // Returns [{ key, n }] naming each counter the instruction waits on, or null
+  // when the line is not a wait instruction.
+  function parseWaitcnt(text) {
+    const s = String(text || "").trim();
+    if (!s) return null;
+    const mnem = mnemOfLineText(s);
+    const operand = s.slice(mnem.length).trim();
+
+    const combined = COMBINED_WAIT_COUNTERS[mnem];
+    if (combined) {
+      const v = parseImmOperand(operand);
+      if (v == null) return null;
+      return [
+        { key: combined[0], n: (v >> 8) & 0xff },
+        { key: combined[1], n: v & 0xff }
+      ];
+    }
+    const single = SINGLE_WAIT_COUNTER[mnem];
+    if (single) {
+      const v = parseImmOperand(operand);
+      if (v == null) return null;
+      return [{ key: single, n: v }];
+    }
+    if (mnem === "s_waitcnt") {
+      const out = [];
+      const vmM = s.match(/vmcnt\((\d+)\)/);
+      const lgkmM = s.match(/lgkmcnt\((\d+)\)/);
+      const expM = s.match(/expcnt\((\d+)\)/);
+      if (vmM) out.push({ key: "vm", n: Number(vmM[1]) });
+      if (lgkmM) out.push({ key: "lgkm", n: Number(lgkmM[1]) });
+      if (expM) out.push({ key: "exp", n: Number(expM[1]) });
+      return out.length ? out : null;
+    }
+    return null;
   }
 
   function findNthPrevLine(fromLineIdx, predicate, nPlus1) {
@@ -452,21 +575,26 @@
     }
     const ln = disasmLines[fromLine];
     const info = ln ? parseWaitcnt(ln.text) : null;
-    if (!info) {
+    if (!info || info.length === 0) {
       if (waitSel) { waitSel = null; waitSelVersion++; }
       return;
     }
     const targets = [];
-    if (info.lgkm != null) {
-      const tLine = findNthPrevLine(Number(fromLine), isDsReadWrite, Number(info.lgkm) + 1);
+    for (const c of info) {
+      const spec = WAIT_COUNTERS[c.key];
+      if (!spec || !Number.isFinite(c.n) || c.n < 0 || c.n > WAIT_MAX_N) continue;
+      // Waiting for at most N outstanding ops means the instruction being waited
+      // on is the (N+1)-th preceding one that bumps this counter.
+      const tLine = findNthPrevLine(Number(fromLine), spec.match, Number(c.n) + 1);
       if (tLine != null && disasmLines[tLine]) {
-        targets.push({ type: "lgkm", n: Number(info.lgkm), line: Number(tLine), pc: Number(disasmLines[tLine].addr) });
-      }
-    }
-    if (info.vm != null) {
-      const tLine = findNthPrevLine(Number(fromLine), isBufferLoad, Number(info.vm) + 1);
-      if (tLine != null && disasmLines[tLine]) {
-        targets.push({ type: "vm", n: Number(info.vm), line: Number(tLine), pc: Number(disasmLines[tLine].addr) });
+        targets.push({
+          type: c.key,
+          cls: spec.cls,
+          label: spec.label,
+          n: Number(c.n),
+          line: Number(tLine),
+          pc: Number(disasmLines[tLine].addr)
+        });
       }
     }
     // Only update version if value changed (reduce redraw churn)
@@ -485,9 +613,18 @@
   const sourceHeader = srcMeta ? srcMeta.parentElement : null;
   let tabDisasmBtn = null;
   let tabOccBtn = null;
+  let copyBtn = null;
   if (sourceHeader) {
     const tabs = document.createElement("div");
     tabs.className = "srcTabs";
+    copyBtn = document.createElement("button");
+    copyBtn.className = "tabBtn";
+    copyBtn.textContent = "Copy";
+    copyBtn.title =
+      "Copy the selected disassembly lines (Ctrl/Cmd+C).\n" +
+      "Click or drag rows to select, Shift+click to extend, Ctrl/Cmd+A for all lines, Esc to clear.\n" +
+      "Right-click the listing for other copy formats.";
+    tabs.appendChild(copyBtn);
     tabDisasmBtn = document.createElement("button");
     tabDisasmBtn.className = "tabBtn active";
     tabDisasmBtn.textContent = "Disasm";
@@ -504,15 +641,334 @@
     if (tabDisasmBtn) tabDisasmBtn.classList.toggle("active", mode === "disasm");
     if (tabOccBtn) tabOccBtn.classList.toggle("active", mode === "occ");
     if (srcBody) srcBody.classList.toggle("noPad", mode === "disasm");
+    hideDisMenu();
     if (mode === "disasm") {
       renderDisasm(disasmLines);
       if (selected && selected.marker_id === currentMarkerId) highlightDisasm(selected.pc);
     } else {
       if (selected) renderOccurrences(selected.marker_id, selected.pc);
     }
+    updateCopyBtn();
   }
   if (tabDisasmBtn) tabDisasmBtn.addEventListener("click", () => setSourceMode("disasm"));
   if (tabOccBtn) tabOccBtn.addEventListener("click", () => setSourceMode("occ"));
+  if (copyBtn) copyBtn.addEventListener("click", () => copySelection("addr"));
+
+  // ---------------------------------------------------------------------------
+  // Disasm selection + copy
+  // ---------------------------------------------------------------------------
+
+  if (srcBody) srcBody.tabIndex = -1;
+
+  function disRangeBounds() {
+    if (!disRange || !disasmLines.length) return null;
+    const lo = Math.max(0, Math.min(disRange.a, disRange.b));
+    const hi = Math.min(disasmLines.length - 1, Math.max(disRange.a, disRange.b));
+    if (hi < lo) return null;
+    return { lo, hi };
+  }
+
+  function setDisRange(a, b) {
+    if (a == null) {
+      if (!disRange) return;
+      disRange = null;
+    } else {
+      const nb = b == null ? a : b;
+      if (disRange && disRange.a === a && disRange.b === nb) return;
+      disRange = { a, b: nb };
+    }
+    disRangeVersion++;
+    updateCopyBtn();
+    if (srcBody && srcBody._updateDis) srcBody._updateDis();
+  }
+
+  function selectAllDisasm() {
+    if (!disasmLines.length) return;
+    setDisRange(0, disasmLines.length - 1);
+  }
+
+  function updateCopyBtn() {
+    if (!copyBtn) return;
+    copyBtn.style.display = sourceMode === "disasm" ? "" : "none";
+    const r = disRangeBounds();
+    const n = r ? r.hi - r.lo + 1 : 0;
+    copyBtn.textContent = n > 0 ? `Copy ${n}` : "Copy";
+  }
+
+  function disasmAddrText(pc) {
+    return "0x" + Number(pc).toString(16).padStart(4, "0");
+  }
+
+  // mode: "addr" (addr + instruction), "text" (instruction only), "counts" (TSV with wave counts)
+  function buildDisasmText(mode) {
+    const r = disRangeBounds();
+    if (!r) return "";
+    const out = [];
+    if (mode === "counts") {
+      const hdr = ["addr", "instruction", "total"];
+      for (let w = 0; w < lanes; w++) hdr.push(`w${w}`);
+      out.push(hdr.join("\t"));
+    }
+    let addrW = 0;
+    if (mode === "addr") {
+      for (let i = r.lo; i <= r.hi; i++) {
+        if (disasmLines[i]) addrW = Math.max(addrW, disasmAddrText(disasmLines[i].addr).length);
+      }
+    }
+    for (let i = r.lo; i <= r.hi; i++) {
+      const ln = disasmLines[i];
+      if (!ln) continue;
+      const text = String(ln.text || "");
+      if (mode === "text") {
+        out.push(text);
+        continue;
+      }
+      const pc = Number(ln.addr);
+      const addr = disasmAddrText(pc);
+      if (mode === "counts") {
+        const hit = pcIndex.get(`${currentMarkerId}|${pc}`);
+        const row = [addr, text, String(hit ? hit.idxs.length : 0)];
+        for (let w = 0; w < lanes; w++) row.push(String(hit ? hit.laneCounts.get(w) || 0 : 0));
+        out.push(row.join("\t"));
+        continue;
+      }
+      out.push(`${addr.padEnd(addrW)}  ${text}`);
+    }
+    return out.join("\n");
+  }
+
+  let _toastTimer = null;
+  function showToast(msg) {
+    let el = document.getElementById("copyToast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "copyToast";
+      el.className = "copyToast";
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.display = "block";
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => { el.style.display = "none"; }, 1500);
+  }
+
+  async function writeClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+    } catch { /* fall through to the legacy path */ }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) return;
+    } catch { /* fall through to the extension host */ }
+    vscode.postMessage({ type: "copyText", text });
+  }
+
+  async function copySelection(mode) {
+    const r = disRangeBounds();
+    if (!r) {
+      showToast("No disasm lines selected");
+      return;
+    }
+    await writeClipboard(buildDisasmText(mode));
+    const n = r.hi - r.lo + 1;
+    showToast(`Copied ${n} line${n === 1 ? "" : "s"}`);
+  }
+
+  let disMenuEl = null;
+  function hideDisMenu() {
+    if (!disMenuEl) return;
+    disMenuEl.remove();
+    disMenuEl = null;
+  }
+
+  function showDisMenu(clientX, clientY) {
+    hideDisMenu();
+    const menu = document.createElement("div");
+    menu.className = "disMenu";
+    const items = [
+      ["Copy (addr + instruction)", () => copySelection("addr")],
+      ["Copy instruction text only", () => copySelection("text")],
+      ["Copy with wave counts (TSV)", () => copySelection("counts")],
+      null,
+      ["Select all lines", () => selectAllDisasm()],
+      ["Clear selection", () => setDisRange(null)],
+    ];
+    for (const it of items) {
+      if (!it) {
+        const sep = document.createElement("div");
+        sep.className = "disMenuSep";
+        menu.appendChild(sep);
+        continue;
+      }
+      const el = document.createElement("div");
+      el.className = "disMenuItem";
+      el.textContent = it[0];
+      el.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        hideDisMenu();
+        it[1]();
+      });
+      menu.appendChild(el);
+    }
+    menu.style.left = clientX + "px";
+    menu.style.top = clientY + "px";
+    document.body.appendChild(menu);
+    disMenuEl = menu;
+    const box = menu.getBoundingClientRect();
+    if (box.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - box.width - 4) + "px";
+    if (box.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - box.height - 4) + "px";
+  }
+
+  function disLineFromPointer(clientY) {
+    const bodyEl = srcBody && srcBody._disBodyEl;
+    if (!bodyEl || !disasmLines.length) return null;
+    const rowH = srcBody._disRowH || 20;
+    const idx = Math.floor((clientY - bodyEl.getBoundingClientRect().top) / rowH);
+    return Math.max(0, Math.min(disasmLines.length - 1, idx));
+  }
+
+  // Drag-select rows. A press that never leaves its starting row stays a plain click, so
+  // native text selection inside one instruction keeps working.
+  let disDrag = null; // { anchor:number, moved:boolean }
+  let disDragClientY = 0;
+  let disDragRaf = 0;
+  let suppressRowClick = false;
+
+  function disDragTo(clientY) {
+    if (!disDrag) return;
+    const idx = disLineFromPointer(clientY);
+    if (idx == null) return;
+    if (!disDrag.moved) {
+      if (idx === disDrag.anchor) return;
+      disDrag.moved = true;
+      const c = srcBody && srcBody._disContainerEl;
+      if (c) c.classList.add("dragging");
+    }
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) sel.removeAllRanges();
+    } catch { /* ignore */ }
+    setDisRange(disDrag.anchor, idx);
+  }
+
+  function disDragAutoScroll() {
+    disDragRaf = 0;
+    if (!disDrag || !disDrag.moved || !srcBody) return;
+    const rect = srcBody.getBoundingClientRect();
+    const EDGE = 24;
+    let dv = 0;
+    if (disDragClientY < rect.top + EDGE) dv = -Math.min(28, (rect.top + EDGE - disDragClientY) * 0.6);
+    else if (disDragClientY > rect.bottom - EDGE) dv = Math.min(28, (disDragClientY - (rect.bottom - EDGE)) * 0.6);
+    if (!dv) return;
+    srcBody.scrollTop += dv;
+    if (srcBody._updateDis) srcBody._updateDis();
+    disDragTo(disDragClientY);
+    disDragRaf = requestAnimationFrame(disDragAutoScroll);
+  }
+
+  function onDisMouseDown(ev) {
+    if (ev.button !== 0 || sourceMode !== "disasm") return;
+    // register tokens keep their own click-to-highlight behavior
+    if (ev.target && ev.target.classList && ev.target.classList.contains("regTok")) return;
+    const idx = disLineFromPointer(ev.clientY);
+    if (idx == null) return;
+    suppressRowClick = false;
+    if (srcBody) {
+      try { srcBody.focus({ preventScroll: true }); } catch { srcBody.focus(); }
+    }
+    if (ev.shiftKey) {
+      const anchor = disRange ? disRange.a : idx;
+      disDrag = { anchor, moved: true };
+      suppressRowClick = true;
+      setDisRange(anchor, idx);
+      ev.preventDefault();
+      return;
+    }
+    disDrag = { anchor: idx, moved: false };
+  }
+
+  function onDisContextMenu(ev) {
+    if (sourceMode !== "disasm") return;
+    ev.preventDefault();
+    const idx = disLineFromPointer(ev.clientY);
+    const r = disRangeBounds();
+    if (idx != null && (!r || idx < r.lo || idx > r.hi)) setDisRange(idx, idx);
+    showDisMenu(ev.clientX, ev.clientY);
+  }
+
+  window.addEventListener("mousemove", (ev) => {
+    if (!disDrag) return;
+    disDragClientY = ev.clientY;
+    disDragTo(ev.clientY);
+    if (disDrag.moved && !disDragRaf) disDragRaf = requestAnimationFrame(disDragAutoScroll);
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!disDrag) return;
+    if (disDrag.moved) suppressRowClick = true;
+    disDrag = null;
+    if (disDragRaf) {
+      cancelAnimationFrame(disDragRaf);
+      disDragRaf = 0;
+    }
+    const c = srcBody && srcBody._disContainerEl;
+    if (c) c.classList.remove("dragging");
+  });
+
+  window.addEventListener("mousedown", (ev) => {
+    if (disMenuEl && !disMenuEl.contains(ev.target)) hideDisMenu();
+  }, true);
+
+  function srcPaneHasFocus() {
+    const ae = document.activeElement;
+    return !!(srcBody && ae && (ae === srcBody || srcBody.contains(ae)));
+  }
+
+  function hasNativeSelectionInSrc() {
+    try {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+      const node = sel.anchorNode;
+      if (!node || !srcBody) return false;
+      return srcBody.contains(node.nodeType === 1 ? node : node.parentNode);
+    } catch {
+      return false;
+    }
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      hideDisMenu();
+      if (srcPaneHasFocus()) setDisRange(null);
+      return;
+    }
+    if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+    if (sourceMode !== "disasm" || !srcPaneHasFocus()) return;
+    const k = String(ev.key || "").toLowerCase();
+    if (k === "c") {
+      // a real text highlight inside the panel wins: let the browser copy it verbatim
+      if (hasNativeSelectionInSrc()) return;
+      if (!disRangeBounds()) return;
+      ev.preventDefault();
+      copySelection("addr");
+    } else if (k === "a") {
+      ev.preventDefault();
+      selectAllDisasm();
+    }
+  });
 
   function requestDisasm(markerId) {
     const p = codeobjFiles[String(markerId)];
@@ -526,8 +982,15 @@
   }
 
   function renderDisasm(lines) {
-    disasmLines = lines || [];
+    const nextLines = lines || [];
+    if (nextLines !== disasmLines) {
+      // a different code object was loaded; line indices no longer mean anything
+      disRange = null;
+      disRangeVersion++;
+    }
+    disasmLines = nextLines;
     disasmAddrToEl = new Map();
+    hideDisMenu();
     if (!srcBody) return;
     // virtualized grid: only render visible rows to avoid huge DOM
     srcBody.innerHTML = "";
@@ -577,6 +1040,11 @@
     body.appendChild(layer);
     disContainer.appendChild(body);
     srcBody.appendChild(disContainer);
+
+    srcBody._disBodyEl = body;
+    srcBody._disContainerEl = disContainer;
+    body.addEventListener("mousedown", onDisMouseDown);
+    body.addEventListener("contextmenu", onDisContextMenu);
 
     // overlay SVG for waitcnt links (folded polyline with arrow)
     // IMPORTANT: attach to disBody so it scrolls with rows (no scrollTop compensation needed).
@@ -645,9 +1113,8 @@
 
       for (const t of waitSel.targets) {
         const yTo = (t.line * ROW_H) + ROW_H * 0.5;
-        const isLgkm = t.type === "lgkm";
         const color = "#ff3b30";
-        const markerId = isLgkm ? "mkLgkm" : "mkVm";
+        const markerId = t.cls === "lgkm" ? "mkLgkm" : "mkVm";
 
         // folded polyline: from -> gutter -> gutter -> target
         const pts = `${xEdge},${yFrom} ${xGutter},${yFrom} ${xGutter},${yTo} ${xEdge},${yTo}`;
@@ -710,6 +1177,7 @@
     let lastCount = -1;
     let lastRegVer = -1;
     let lastWaitVer = -1;
+    let lastRangeVer = -1;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -738,10 +1206,13 @@
       const first = Math.max(0, Math.floor(scrollTop / ROW_H) - overscan);
       const count = Math.min(disasmLines.length - first, Math.ceil(viewH / ROW_H) + overscan * 2);
       // Wait links are attached to disBody and scroll naturally with rows.
-      if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion && lastWaitVer === waitSelVersion) return;
+      if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion
+        && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion) return;
       lastFirst = first; lastCount = count;
       lastRegVer = regSelVersion;
       lastWaitVer = waitSelVersion;
+      lastRangeVer = disRangeVersion;
+      const range = disRangeBounds();
       ensurePool(count);
       for (let i = 0; i < pool.length; i++) {
         const row = pool[i];
@@ -761,9 +1232,17 @@
         const color = COLORS[cat] || "#ddd";
 
         row.classList.toggle("selected", selected && selected.marker_id === currentMarkerId && selected.pc === pc);
+        row.classList.toggle("rangeSel", !!range && idx >= range.lo && idx <= range.hi);
         const isWaitFrom = !!(waitSel && Number(idx) === Number(waitSel.fromLine));
-        const isWaitTlgkm = !!(waitSel && waitSel.targets && waitSel.targets.some((t) => t.type === "lgkm" && Number(t.line) === Number(idx)));
-        const isWaitTvm = !!(waitSel && waitSel.targets && waitSel.targets.some((t) => t.type === "vm" && Number(t.line) === Number(idx)));
+        const waitTargetOfCls = (cls) => (
+          waitSel && waitSel.targets
+            ? waitSel.targets.find((t) => t.cls === cls && Number(t.line) === Number(idx))
+            : null
+        );
+        const waitTlgkm = waitTargetOfCls("lgkm");
+        const waitTvm = waitTargetOfCls("vm");
+        const isWaitTlgkm = !!waitTlgkm;
+        const isWaitTvm = !!waitTvm;
         row.classList.toggle("waitFrom", isWaitFrom);
         row.classList.toggle("waitTargetLgkm", isWaitTlgkm);
         row.classList.toggle("waitTargetVmcnt", isWaitTvm);
@@ -774,8 +1253,8 @@
         {
           const addr = "0x" + pc.toString(16).padStart(4, "0");
           let badges = "";
-          if (isWaitTlgkm) badges += ` <span class="waitBadge lgkm">LGKM</span>`;
-          if (isWaitTvm) badges += ` <span class="waitBadge vm">VM</span>`;
+          if (waitTlgkm) badges += ` <span class="waitBadge lgkm">${escapeHtml(waitTlgkm.label)}</span>`;
+          if (waitTvm) badges += ` <span class="waitBadge vm">${escapeHtml(waitTvm.label)}</span>`;
           cells[0].innerHTML = escapeHtml(addr) + badges;
         }
         cells[1].className = "disCell disTextCell";
@@ -789,8 +1268,7 @@
         if (isWaitFrom && waitSel && waitSel.targets && waitSel.targets.length) {
           const parts = waitSel.targets.map((t) => {
             const p = "0x" + Number(t.pc).toString(16);
-            if (t.type === "lgkm") return `LGKM(${t.n}) ↖ ${p}`;
-            return `VM(${t.n}) ↖ ${p}`;
+            return `${t.label}(${t.n}) ↖ ${p}`;
           });
           txtHtml += ` <span class="waitHint">${escapeHtml(parts.join("   "))}</span>`;
         }
@@ -825,7 +1303,13 @@
               if (srcBody && srcBody._updateDis) srcBody._updateDis();
               return;
             }
+            if (suppressRowClick) {
+              // tail of a drag-select; the range is already set
+              suppressRowClick = false;
+              return;
+            }
             const pcNow = Number(row.dataset.addr);
+            setDisRange(Number(row.dataset.line));
             const hitNow = pcIndex.get(`${currentMarkerId}|${pcNow}`);
             if (!hitNow) return;
             panToIssue(hitNow.first);
@@ -863,6 +1347,7 @@
     updateWaitSelFromSelected();
     requestWaitLinks();
     updateVisible();
+    updateCopyBtn();
   }
 
   function highlightDisasm(pc) {
@@ -934,12 +1419,24 @@
     controls.appendChild(sel);
     srcBody.appendChild(controls);
 
-    const asm = events[0].asm || "";
+    // Take the instruction text from the unfiltered list: a lane filter can legitimately match
+    // nothing, and the header should still say which instruction is being inspected.
+    const asm = (allEvents[0] && allEvents[0].asm) || "";
     const hint = document.createElement("div");
     hint.className = "occHint";
     const laneSuffix = occLaneFilter == null ? "" : `   lane=w${occLaneFilter}`;
     hint.textContent = `${asm || "(unknown)"}   marker=${markerId} pc=0x${Number(pc).toString(16)}   count=${events.length}${laneSuffix}`;
     srcBody.appendChild(hint);
+
+    if (events.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "occHint";
+      empty.textContent = occLaneFilter == null
+        ? "No occurrences recorded for this instruction."
+        : `This instruction never issued on w${occLaneFilter}. Pick another lane or "all".`;
+      srcBody.appendChild(empty);
+      return;
+    }
 
     const table = document.createElement("table");
     table.className = "occTable";
@@ -1167,6 +1664,24 @@
     ctx.fill();
   }
 
+  // Wait-like instructions (s_wait_*, s_barrier_wait) are reported with duration == stall + 1,
+  // so their issue slice alone would be a sub-pixel sliver: draw the whole span as one bar.
+  function eventSpan(e) {
+    const t0 = e.issue;
+    const stall = Math.max(0, e.stall || 0);
+    const dur = Math.max(1, e.duration || 1);
+    const exec = Math.max(0, dur - stall);
+    const spanBar = e.cat === "IMMED" && stall > 0;
+    return {
+      t0,
+      stall,
+      hasBar: spanBar || exec > 0,
+      barStart: spanBar ? t0 : t0 + stall,
+      barLen: spanBar ? dur : exec,
+      hasStallLine: stall > 0 && !spanBar,
+    };
+  }
+
   function drawEvents() {
     for (let lane = 0; lane < lanes; lane++) {
       const y = TOP_PAD + lane * ROW_H;
@@ -1177,7 +1692,7 @@
       const pad = (view.max - view.min) * 0.05;
       let lo = 0,
         hi = evs.length;
-      const target = view.min - pad;
+      const target = view.min - pad - maxSpanByLane[lane];
       while (lo < hi) {
         const mid = (lo + hi) >> 1;
         if (evs[mid].issue < target) lo = mid + 1;
@@ -1187,31 +1702,21 @@
       for (let i = lo; i < evs.length; i++) {
         const e = evs[i];
         if (e.issue > view.max + pad) break;
-        const t0 = e.issue; // first attempted
-        const stall = Math.max(0, e.stall || 0);
-        const dur = Math.max(1, e.duration || 1);
-        const t_issue = t0 + stall;      // successful issue time (if any)
-        const exec = Math.max(0, dur - stall); // execution/issue cycles; can be 0 for wait-like insts
+        const s = eventSpan(e);
 
-        const isImmed = e.cat === "IMMED";
-        // issue/exec bar:
-        // - normal: [t_issue, t_issue + exec]
-        // - immed with exec==0: render as a bar covering [t0, t0+dur] (no separate stall line)
-        if (exec > 0 || (isImmed && exec === 0)) {
-          const barStart = (isImmed && exec === 0) ? t0 : t_issue;
-          const barLen = (isImmed && exec === 0) ? dur : exec;
-          const x1 = xScale(barStart);
-          const x2 = xScale(barStart + Math.max(1, barLen));
+        if (s.hasBar) {
+          const x1 = xScale(s.barStart);
+          const x2 = xScale(s.barStart + Math.max(1, s.barLen));
           const ww = Math.max(1, x2 - x1);
           ctx.fillStyle = COLORS[e.cat] || "#999";
           // rounded bars to make separation clearer
           fillRoundRect(x1, rowY, ww, rowH, 3);
         }
 
-        // stall line (aligned to bottom edge): [t0, t_issue]
-        if (stall > 0 && !(isImmed && exec === 0)) {
-          const sx1 = xScale(t0);
-          const sx2 = xScale(t_issue);
+        // stall line (aligned to bottom edge): [t0, t0 + stall]
+        if (s.hasStallLine) {
+          const sx1 = xScale(s.t0);
+          const sx2 = xScale(s.t0 + s.stall);
           // bottom edge of the bar, keep inside pixels
           const yy = rowY + rowH - 1;
           ctx.save();
@@ -1335,20 +1840,12 @@
         if (d < bestDist) { bestDist = d; e = it; }
       }
       if (e) {
-        const t0 = e.issue;
-        const stall = Math.max(0, e.stall || 0);
-        const dur = Math.max(1, e.duration || 1);
-        const t_issue = t0 + stall;
-        const exec = Math.max(0, dur - stall);
-        const isImmed = e.cat === "IMMED";
+        const s = eventSpan(e);
         ctx.save();
-        if (exec > 0 || (isImmed && exec === 0)) {
+        if (s.hasBar) {
           // Selection highlight should include stall-line span when present.
-          const barStart = (isImmed && exec === 0) ? t0 : t_issue;
-          const barLen = (isImmed && exec === 0) ? dur : exec;
-          const hasStallLine = stall > 0 && !(isImmed && exec === 0);
-          const hlStart = hasStallLine ? t0 : barStart;
-          const hlEnd = barStart + Math.max(1, barLen);
+          const hlStart = s.hasStallLine ? s.t0 : s.barStart;
+          const hlEnd = s.barStart + Math.max(1, s.barLen);
           const x1 = xScale(hlStart);
           const x2 = xScale(hlEnd);
           // stronger highlight: translucent fill + thicker stroke
@@ -1358,9 +1855,9 @@
           ctx.lineWidth = 2;
           ctx.strokeRect(x1 - 2, rowY - 2, Math.max(4, x2 - x1 + 4), rowH + 4);
         } else {
-          // wait-like instruction: highlight the stall line span
-          const sx1 = xScale(t0);
-          const sx2 = xScale(t_issue);
+          // stall-only event: highlight the stall line span
+          const sx1 = xScale(s.t0);
+          const sx2 = xScale(s.t0 + s.stall);
           const yy = rowY + rowH - 1;
           ctx.strokeStyle = "rgba(255,255,255,0.95)";
           ctx.lineWidth = 2;
