@@ -171,7 +171,14 @@ def main() -> None:
 
     min_c = min(e.issue for e in events) if events else 0
     max_c = max((e.issue + max(1, e.duration) for e in events), default=0)
-    lanes = max((e.lane for e in events), default=-1) + 1
+
+    # A timeline row is a wave *slot* on one (CU/WGP, SIMD), not a wave: the decoder reuses a
+    # slot when a new wave lands in it. The decoder hands out lane ids in the order it happens
+    # to emit waves, so renumber by (cu, simd, slot) to make row order deterministic and
+    # monotone in slot id.
+    slots = sorted({(e.cu, e.simd, e.slot) for e in events})
+    lane_of = {t: i for (i, t) in enumerate(slots)}
+    lanes = len(slots)
 
     out_events = []
     for e in events:
@@ -181,7 +188,7 @@ def main() -> None:
             cat = "MFMA"
         out_events.append(
             {
-                "lane": e.lane,
+                "lane": lane_of[(e.cu, e.simd, e.slot)],
                 "cu": e.cu,
                 "simd": e.simd,
                 "slot": e.slot,
@@ -200,6 +207,7 @@ def main() -> None:
         "min_cycle": int(min_c),
         "max_cycle": int(max_c),
         "lanes": int(lanes),
+        "lane_info": [{"cu": c, "simd": s, "slot": sl} for (c, s, sl) in slots],
         "events": out_events,
         "colors": DEFAULT_COLORS,
         "cat_names": {str(k): v for (k, v) in CAT_NAMES.items()},

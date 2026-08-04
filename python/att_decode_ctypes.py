@@ -148,9 +148,10 @@ def decode_att(
     @_CB
     def cb(record_type: int, events_ptr: int, n: int, _user: int) -> None:
         nonlocal gfxip_major
-        if record_type == RECORD_GFXIP and events_ptr and n:
-            val = C.cast(events_ptr, C.POINTER(C.c_size_t))[0]
-            gfxip_major = int(val)
+        if record_type == RECORD_GFXIP:
+            # The decoder passes gfxip_major *by value* in the payload slot and leaves n == 0,
+            # so this must not be dereferenced (the value, e.g. 12, is not a valid address).
+            gfxip_major = int(events_ptr or 0)
             return
         if record_type == RECORD_INFO and events_ptr and n:
             infos = C.cast(events_ptr, C.POINTER(C.c_int))

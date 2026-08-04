@@ -4,6 +4,15 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Label timeline rows by wave *slot* instead of `wave N`. A row is a wave slot on the single
+  traced (CU/WGP, SIMD) and a slot hosts a new wave whenever the previous one retires, so the
+  old label was wrong whenever a slot was reused. Row order is now sorted by
+  `(cu, simd, slot)` rather than by whichever wave the decoder emitted first, so row N really
+  is slot N. Disassembly count columns, the Occurrences slot filter and the TSV copy header
+  follow the same naming, and the header line reports `wgp=/cu=` and `simd=` for the traced
+  scope
+- Fix `gfxip_major` always decoding as 0: the decoder passes it by value in the payload slot
+  with `n == 0`, so the old code both skipped it and would have segfaulted had it not
 - Fix a crash in the Occurrences pane when the lane filter selects a wave on which the
   instruction never issued (`Cannot read properties of undefined (reading 'asm')`); the pane
   now keeps the instruction header and explains that the lane has no occurrences

@@ -148,6 +148,50 @@
   const CAT_NAMES = DATA.cat_names;
 
   const lanes = DATA.lanes;
+
+  // A row is a wave *slot* on one (CU/WGP, SIMD), not a wave. ATT only produces per-wave
+  // records for the single target CU + target SIMD, and a slot hosts a new wave whenever the
+  // previous one retires, so rows are labelled by slot id rather than by row index. Older
+  // cached JSON has no lane_info, so fall back to reading it off the events.
+  const laneInfo = (() => {
+    const arr = new Array(lanes).fill(null);
+    if (Array.isArray(DATA.lane_info)) {
+      for (let i = 0; i < lanes && i < DATA.lane_info.length; i++) {
+        const l = DATA.lane_info[i];
+        if (l) arr[i] = { cu: l.cu, simd: l.simd, slot: l.slot };
+      }
+    }
+    for (const e of DATA.events) {
+      if (e.lane < 0 || e.lane >= lanes || arr[e.lane]) continue;
+      arr[e.lane] = { cu: e.cu, simd: e.simd, slot: e.slot };
+    }
+    for (let i = 0; i < lanes; i++) if (!arr[i]) arr[i] = { cu: 0, simd: 0, slot: i };
+    return arr;
+  })();
+  const sameCu = laneInfo.every((l) => l.cu === laneInfo[0].cu);
+  const sameSimd = laneInfo.every((l) => l.simd === laneInfo[0].simd);
+  // gfx10+ reports a WGP id where gfx9 reports a CU id
+  const CU_WORD = (DATA.meta && Number(DATA.meta.gfxip_major) >= 10) ? "wgp" : "cu";
+
+  function laneLabel(i) {
+    const l = laneInfo[i];
+    if (!l) return `slot ${i}`;
+    if (sameCu && sameSimd) return `slot ${l.slot}`;
+    if (sameCu) return `sm${l.simd} sl${l.slot}`;
+    return `${l.cu}.${l.simd}.${l.slot}`;
+  }
+  // narrow variant for the per-slot disasm columns
+  function laneLabelShort(i) {
+    const l = laneInfo[i];
+    if (!l) return `s${i}`;
+    return (sameCu && sameSimd) ? `s${l.slot}` : `${l.simd}.${l.slot}`;
+  }
+  function laneTitle(i) {
+    const l = laneInfo[i];
+    if (!l) return `row ${i}`;
+    return `${CU_WORD}=${l.cu} simd=${l.simd} slot=${l.slot}`;
+  }
+
   const eventsByLane = [];
   for (let i = 0; i < lanes; i++) eventsByLane.push([]);
   for (const e of DATA.events) eventsByLane[e.lane].push(e);
@@ -189,7 +233,10 @@
 
   const codeobjFiles = (DATA.meta && DATA.meta.codeobj_files) ? DATA.meta.codeobj_files : {};
 
-  metaEl.textContent = `lanes=${lanes}  events=${DATA.events.length}  cycles=[${DATA.min_cycle}, ${DATA.max_cycle}]`;
+  const scopeText = (sameCu && sameSimd)
+    ? `${CU_WORD}=${laneInfo[0].cu} simd=${laneInfo[0].simd}  `
+    : "";
+  metaEl.textContent = `${scopeText}slots=${lanes}  events=${DATA.events.length}  cycles=[${DATA.min_cycle}, ${DATA.max_cycle}]`;
 
   function renderLegend() {
     legendEl.innerHTML = "";
@@ -699,14 +746,14 @@
     return "0x" + Number(pc).toString(16).padStart(4, "0");
   }
 
-  // mode: "addr" (addr + instruction), "text" (instruction only), "counts" (TSV with wave counts)
+  // mode: "addr" (addr + instruction), "text" (instruction only), "counts" (TSV, per-slot counts)
   function buildDisasmText(mode) {
     const r = disRangeBounds();
     if (!r) return "";
     const out = [];
     if (mode === "counts") {
       const hdr = ["addr", "instruction", "total"];
-      for (let w = 0; w < lanes; w++) hdr.push(`w${w}`);
+      for (let w = 0; w < lanes; w++) hdr.push(laneLabelShort(w));
       out.push(hdr.join("\t"));
     }
     let addrW = 0;
@@ -800,7 +847,7 @@
     const items = [
       ["Copy (addr + instruction)", () => copySelection("addr")],
       ["Copy instruction text only", () => copySelection("text")],
-      ["Copy with wave counts (TSV)", () => copySelection("counts")],
+      ["Copy with per-slot counts (TSV)", () => copySelection("counts")],
       null,
       ["Select all lines", () => selectAllDisasm()],
       ["Clear selection", () => setDisRange(null)],
@@ -1023,7 +1070,8 @@
     for (let w = 0; w < lanes; w++) {
       const hw = document.createElement("div");
       hw.className = "disCell disNumCell";
-      hw.textContent = `w${w}`;
+      hw.textContent = laneLabelShort(w);
+      hw.title = laneTitle(w);
       header.appendChild(hw);
     }
     disContainer.appendChild(header);
@@ -1395,7 +1443,7 @@
     const lab = document.createElement("span");
     lab.className = "occHint";
     lab.style.margin = "0";
-    lab.textContent = "Lane:";
+    lab.textContent = "Slot:";
     const sel = document.createElement("select");
     sel.className = "occLaneSel";
     const optAll = document.createElement("option");
@@ -1405,7 +1453,8 @@
     for (let l = 0; l < lanes; l++) {
       const o = document.createElement("option");
       o.value = String(l);
-      o.textContent = `w${l}`;
+      o.textContent = laneLabel(l);
+      o.title = laneTitle(l);
       sel.appendChild(o);
     }
     sel.value = occLaneFilter == null ? "all" : String(occLaneFilter);
@@ -1424,7 +1473,7 @@
     const asm = (allEvents[0] && allEvents[0].asm) || "";
     const hint = document.createElement("div");
     hint.className = "occHint";
-    const laneSuffix = occLaneFilter == null ? "" : `   lane=w${occLaneFilter}`;
+    const laneSuffix = occLaneFilter == null ? "" : `   ${laneTitle(occLaneFilter)}`;
     hint.textContent = `${asm || "(unknown)"}   marker=${markerId} pc=0x${Number(pc).toString(16)}   count=${events.length}${laneSuffix}`;
     srcBody.appendChild(hint);
 
@@ -1433,7 +1482,7 @@
       empty.className = "occHint";
       empty.textContent = occLaneFilter == null
         ? "No occurrences recorded for this instruction."
-        : `This instruction never issued on w${occLaneFilter}. Pick another lane or "all".`;
+        : `This instruction never issued on ${laneLabel(occLaneFilter)}. Pick another slot or "all".`;
       srcBody.appendChild(empty);
       return;
     }
@@ -1442,7 +1491,7 @@
     table.className = "occTable";
     table.innerHTML = `
       <thead><tr>
-        <th>#</th><th>lane</th><th>t0</th><th>Δt0</th><th>stall</th><th>exec</th><th>dur</th><th>cat</th>
+        <th>#</th><th>slot</th><th>t0</th><th>Δt0</th><th>stall</th><th>exec</th><th>dur</th><th>cat</th>
       </tr></thead>
       <tbody></tbody>`;
     srcBody.appendChild(table);
@@ -1467,7 +1516,7 @@
         tr.dataset.key = rowKey;
         tr.innerHTML = `
           <td>${i}</td>
-          <td>${e.lane}</td>
+          <td>${e.slot}</td>
           <td>${t0}</td>
           <td>${dt0 == null ? "" : dt0}</td>
           <td>${stall}</td>
@@ -1646,7 +1695,7 @@
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     for (let i = 0; i < lanes; i++) {
       const y = TOP_PAD + i * ROW_H;
-      ctx.fillText(`wave ${i}`, 8, y + 1);
+      ctx.fillText(laneLabel(i), 8, y + 1);
     }
 
     ctx.restore();
@@ -1911,7 +1960,7 @@
       `category=${e.cat}  raw=${CAT_NAMES[String(e.category)] || ""}\n` +
       `t0=${t0}  t_issue=${tIssue}  t_end=${tEnd}\n` +
       `duration=${dur}  stall=${stall}  exec(duration-stall)=${exec}\n` +
-      `cu=${e.cu} simd=${e.simd} slot=${e.slot} lane=${e.lane}`;
+      `${CU_WORD}=${e.cu} simd=${e.simd} slot=${e.slot}`;
     tip.style.display = "block";
     const pad = 14;
     tip.style.left = x + pad + "px";

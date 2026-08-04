@@ -86,8 +86,17 @@ Disassembly:
 - Select `s_waitcnt lgkmcnt(N)` / `vmcnt(N)` to show a polyline arrow to the corresponding previous memory op
 - Click or drag rows to select lines, Shift + click to extend, Ctrl/Cmd + A to select all, Esc to clear
 - Ctrl/Cmd + C (or the `Copy` button) copies the selected lines as `addr  instruction`
-- Right-click the listing for other copy formats (instruction text only, or TSV with per-wave counts)
+- Right-click the listing for other copy formats (instruction text only, or TSV with per-slot counts)
 - Dragging inside a single line still makes a normal text selection, so partial copies work too
+
+## Reading the rows
+
+ATT only produces per-wave records for one CU/WGP and one SIMD, chosen by `--att-target-cu`
+and `--att-simd-select` (on gfx10+ the latter is a SIMD *id*, not a bitmask, so exactly one
+SIMD is traced). So each timeline row is a **wave slot** on that one SIMD, labelled `slot N`,
+and the header line names the traced scope, e.g. `wgp=1 simd=3 slots=10`. A slot hosts a new
+wave whenever the previous one retires, so one row can contain a sequence of waves rather than
+a single wave. The other SIMDs contribute VMEM issue events only, without wave attribution.
 
 ## Troubleshooting
 
