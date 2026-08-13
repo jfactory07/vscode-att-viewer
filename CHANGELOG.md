@@ -4,6 +4,8 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Clip the timeline to the plot area, so panning right no longer slides event bars, markers,
+  the measure band and the selection outline over the wave-slot labels in the left gutter
 - Fix `gpuArch is not defined` aborting the open of any trace whose decoded JSON exceeds the
   webview soft limit. The first decode succeeds and the event-capped second one then throws a
   `ReferenceError`, because it still passed a variable that went away with the

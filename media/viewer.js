@@ -2241,6 +2241,14 @@
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     drawGrid();
+
+    // Everything below is placed by xScale, whose origin is LEFT_PAD, so panning
+    // right slides content into the gutter and paints over the lane labels.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(LEFT_PAD, 0, Math.max(0, canvas.width - LEFT_PAD), canvas.height);
+    ctx.clip();
+
     drawEvents();
     // user markers (draw over events)
     if (MARKERS && MARKERS.length) {
@@ -2311,6 +2319,8 @@
         ctx.restore();
       }
     }
+
+    ctx.restore();
   }
 
   function findEvent(lane, cycle) {
