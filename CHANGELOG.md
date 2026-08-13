@@ -4,6 +4,20 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Stack overlapping execution windows into sub-rows within a slot's row. A bar covers an
+  instruction's execution, and on gfx10+ `duration` is `stall + execution time`, so windows
+  overlap whenever a wave issues into a multi-cycle pipe faster than it drains: four
+  `ds_store_b128` issued one per cycle each run 3 cycles, and an 8-cycle
+  `v_wmma_f32_16x16x32_f16` runs while scalar ops keep issuing behind it. Those bars used to
+  paint over each other and read as one blob. Sub-rows are assigned first fit in issue order, so
+  a row reads top-down in issue order and a stack of *n* bars means *n* instructions in flight;
+  measured over the traces at hand, slots need two or three sub-rows and 85–95% of records stay
+  on the top one. A slot with no overlap keeps its original height, and a slot that stacks splits
+  the same height instead of making the timeline taller. Hover and click resolve to the sub-row
+  under the pointer, and the tooltip reports it as `sub-row=2/3`
+- Fix the disassembly highlight going stale when a timeline click lands in the same virtualized
+  window as the previous one (a neighbouring instruction, or another sub-row of the same stack):
+  the row repaint did not track the selection
 - Clip the timeline to the plot area, so panning right no longer slides event bars, markers,
   the measure band and the selection outline over the wave-slot labels in the left gutter
 - Fix `gpuArch is not defined` aborting the open of any trace whose decoded JSON exceeds the

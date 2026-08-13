@@ -79,6 +79,8 @@ Timeline:
 - Shift + WASD: faster pan/zoom
 - Ctrl + left-drag: measure cycle interval (shows Δcycles)
 - Alt + click: add/remove a vertical cycle marker
+- Hover or click a bar: the instruction on the sub-row under the pointer, when execution windows
+  overlap (see [Overlapping execution windows](#overlapping-execution-windows))
 
 Disassembly:
 
@@ -117,6 +119,23 @@ SIMD is traced). So each timeline row is a **wave slot** on that one SIMD, label
 and the header line names the traced scope, e.g. `wgp=1 simd=3 slots=10`. A slot hosts a new
 wave whenever the previous one retires, so one row can contain a sequence of waves rather than
 a single wave. The other SIMDs contribute VMEM issue events only, without wave attribution.
+
+## Overlapping execution windows
+
+A bar covers an instruction's **execution**, not its issue slot. On gfx10+ the decoder reports
+`duration` as `stall + execution time`, `t0 + stall` as the cycle the instruction issued and
+`t0 + duration` as the cycle it finished, so a wave that issues one instruction per cycle into a
+multi-cycle pipe has several instructions running at once and their windows genuinely overlap.
+Four `ds_store_b128` issued at 42249..42252 each run 3 cycles; a `v_wmma_f32_16x16x32_f16` runs
+8 cycles while `s_cmp`/`s_cselect`/`s_cbranch` keep issuing behind it.
+
+Overlapping windows are therefore stacked into **sub-rows** inside the slot's row, first fit in
+issue order: an instruction takes the topmost sub-row that is free at its issue cycle, so the
+row reads top-down in issue order, a stack of *n* bars means *n* instructions in flight, and the
+top sub-row is reused as soon as it frees up. A slot whose windows never overlap keeps its
+original single-row height; a slot that needs sub-rows splits the same height between them
+rather than making the timeline taller. Hovering or clicking picks the instruction on the
+sub-row under the pointer, and the tooltip names it as `sub-row=2/3`.
 
 ## Troubleshooting
 

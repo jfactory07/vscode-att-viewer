@@ -81,6 +81,17 @@
 
   const ROW_H = 14;
   const ROW_PAD = 2;
+  // On gfx10+ the decoder reports duration as stall + *execution* time, so a wave issues the
+  // next instruction while the previous one is still running: an 8-cycle WMMA with SALU issuing
+  // behind it, or four 3-cycle ds_store_b128 issued one per cycle. Those windows genuinely
+  // overlap, so a slot's row is split into sub-rows and overlapping windows are stacked. Real
+  // traces need at most three sub-rows; a deeper pile-up shares the last one.
+  const SUB_CAP = 4;
+  const SUB_GAP = 1;
+  // Cap on a slot's total row height, so stacking makes bars thinner instead of the timeline
+  // taller. A slot with no overlap keeps the original single-row look, and a stacked bar is
+  // never thicker than that one.
+  const LANE_H_MAX = 30;
   // leave room for the cycle axis labels so wave0 doesn't overlap
   const TOP_PAD = 24;
   const LEFT_PAD = 80;
@@ -208,6 +219,67 @@
   const maxSpanByLane = eventsByLane.map((evs) =>
     evs.reduce((m, e) => Math.max(m, e.duration || 1), 1)
   );
+
+  // Pack overlapping execution windows into sub-rows, first fit in issue order: an instruction
+  // takes the topmost sub-row that is free at its issue cycle, so a row reads top-down in issue
+  // order and concurrent instructions stay countable instead of painting over each other.
+  const subRowsByLane = new Array(lanes).fill(1);
+  for (let lane = 0; lane < lanes; lane++) {
+    const ends = [];
+    let deepest = 0;
+    for (const e of eventsByLane[lane]) {
+      const s = eventSpan(e);
+      const start = s.barStart;
+      let d = 0;
+      while (d < ends.length && ends[d] > start) d++;
+      if (d >= SUB_CAP) d = SUB_CAP - 1;
+      ends[d] = s.barStart + Math.max(1, s.barLen);
+      e.depth = d;
+      if (d > deepest) deepest = d;
+    }
+    subRowsByLane[lane] = deepest + 1;
+  }
+
+  const subHByLane = subRowsByLane.map((n) =>
+    n <= 1
+      ? ROW_H - ROW_PAD * 2
+      : Math.min(
+          ROW_H - ROW_PAD * 2,
+          Math.max(3, Math.floor((LANE_H_MAX - ROW_PAD * 2 - (n - 1) * SUB_GAP) / n))
+        )
+  );
+  const laneHByLane = subRowsByLane.map(
+    (n, i) => ROW_PAD * 2 + n * subHByLane[i] + (n - 1) * SUB_GAP
+  );
+  const laneYByLane = [];
+  {
+    let y = TOP_PAD;
+    for (let i = 0; i < lanes; i++) {
+      laneYByLane.push(y);
+      y += laneHByLane[i];
+    }
+  }
+  const lanesTotalH = laneHByLane.reduce((a, b) => a + b, 0);
+
+  function laneAtY(y) {
+    for (let i = 0; i < lanes; i++) {
+      if (y >= laneYByLane[i] && y < laneYByLane[i] + laneHByLane[i]) return i;
+    }
+    return -1;
+  }
+
+  function subRowAtY(lane, y) {
+    const n = subRowsByLane[lane];
+    if (n <= 1) return 0;
+    const step = subHByLane[lane] + SUB_GAP;
+    const d = Math.floor((y - (laneYByLane[lane] + ROW_PAD)) / step);
+    return Math.max(0, Math.min(n - 1, d));
+  }
+
+  function subRowY(lane, depth) {
+    const d = Math.max(0, Math.min(subRowsByLane[lane] - 1, depth || 0));
+    return laneYByLane[lane] + ROW_PAD + d * (subHByLane[lane] + SUB_GAP);
+  }
 
   // index: marker|pc -> stats + list of event refs
   // stats include per-lane counts and dominant category for coloring disasm
@@ -1598,6 +1670,7 @@
     let lastWaitVer = -1;
     let lastRangeVer = -1;
     let lastSearchVer = -1;
+    let lastSelKey = null;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -1625,11 +1698,16 @@
       const overscan = 20;
       const first = Math.max(0, Math.floor(scrollTop / ROW_H) - overscan);
       const count = Math.min(disasmLines.length - first, Math.ceil(viewH / ROW_H) + overscan * 2);
+      // The selection is part of the row state, so a click landing in the same virtualized
+      // window (a neighbouring instruction, or another sub-row of the same stack) must still
+      // repaint; otherwise the highlight stays on the previously selected line.
+      const selKey = selected ? `${selected.marker_id}|${selected.pc}` : null;
       // Wait links are attached to disBody and scroll naturally with rows.
       if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion
         && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion
-        && lastSearchVer === disSearchVersion) return;
+        && lastSearchVer === disSearchVersion && lastSelKey === selKey) return;
       lastFirst = first; lastCount = count;
+      lastSelKey = selKey;
       lastRegVer = regSelVersion;
       lastWaitVer = waitSelVersion;
       lastRangeVer = disRangeVersion;
@@ -2047,7 +2125,7 @@
 
   function resize() {
     const width = viewport.clientWidth;
-    const height = Math.max(viewport.clientHeight, TOP_PAD + lanes * ROW_H + 30);
+    const height = Math.max(viewport.clientHeight, TOP_PAD + lanesTotalH + 30);
     // keep canvas width == viewport to avoid horizontal scroll hiding wave labels
     canvas.width = Math.max(1, width);
     canvas.height = height;
@@ -2087,8 +2165,17 @@
 
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     for (let i = 0; i < lanes; i++) {
-      const y = TOP_PAD + i * ROW_H;
-      ctx.fillText(laneLabel(i), 8, y + 1);
+      ctx.fillText(laneLabel(i), 8, laneYByLane[i] + 1);
+    }
+
+    // Slot separators: without them, stacked sub-rows of adjacent slots read as one block.
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    for (let i = 1; i < lanes; i++) {
+      const y = Math.round(laneYByLane[i]) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(LEFT_PAD - 8, y);
+      ctx.lineTo(canvas.width, y);
+      ctx.stroke();
     }
 
     ctx.restore();
@@ -2126,9 +2213,7 @@
 
   function drawEvents() {
     for (let lane = 0; lane < lanes; lane++) {
-      const y = TOP_PAD + lane * ROW_H;
-      const rowY = y + ROW_PAD;
-      const rowH = ROW_H - ROW_PAD * 2;
+      const rowH = subHByLane[lane];
       const evs = eventsByLane[lane];
 
       const pad = (view.max - view.min) * 0.05;
@@ -2145,6 +2230,7 @@
         const e = evs[i];
         if (e.issue > view.max + pad) break;
         const s = eventSpan(e);
+        const rowY = subRowY(lane, e.depth);
 
         if (s.hasBar) {
           const x1 = xScale(s.barStart);
@@ -2155,7 +2241,7 @@
           fillRoundRect(x1, rowY, ww, rowH, 3);
         }
 
-        // stall line (aligned to bottom edge): [t0, t0 + stall]
+        // stall line (aligned to the bottom edge of this event's sub-row): [t0, t0 + stall]
         if (s.hasStallLine) {
           const sx1 = xScale(s.t0);
           const sx2 = xScale(s.t0 + s.stall);
@@ -2276,9 +2362,7 @@
     // selected outline
     if (selected) {
       const lane = selected.lane;
-      const y = TOP_PAD + lane * ROW_H;
-      const rowY = y + ROW_PAD;
-      const rowH = ROW_H - ROW_PAD * 2;
+      const rowH = subHByLane[lane];
       // find the event at this pc near this issue
       const evs = eventsByLane[lane] || [];
       let e = null;
@@ -2291,6 +2375,7 @@
       }
       if (e) {
         const s = eventSpan(e);
+        const rowY = subRowY(lane, e.depth);
         ctx.save();
         if (s.hasBar) {
           // Selection highlight should include stall-line span when present.
@@ -2323,29 +2408,35 @@
     ctx.restore();
   }
 
-  function findEvent(lane, cycle) {
+  // Several events can cover one cycle once their windows overlap, so the hovered sub-row picks
+  // which one: without it, hovering the stack would always report whichever happens to be found
+  // first. depth == null means "closest to the top".
+  function findEvent(lane, cycle, depth) {
     const evs = eventsByLane[lane];
     if (!evs || evs.length === 0) return null;
     let lo = 0,
-      hi = evs.length - 1;
-    while (lo <= hi) {
+      hi = evs.length;
+    const target = cycle - maxSpanByLane[lane] - 1;
+    while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      const e = evs[mid];
-      if (cycle < e.issue) hi = mid - 1;
-      else if (cycle > e.issue) lo = mid + 1;
-      else return e;
+      if (evs[mid].issue < target) lo = mid + 1;
+      else hi = mid;
     }
-    const idx = Math.max(0, Math.min(evs.length - 1, hi));
-    const e = evs[idx];
-    const end = e.issue + Math.max(1, e.duration);
-    if (cycle >= e.issue && cycle <= end) return e;
-    for (const j of [idx - 1, idx + 1]) {
-      if (j < 0 || j >= evs.length) continue;
-      const ee = evs[j];
-      const eeEnd = ee.issue + Math.max(1, ee.duration);
-      if (cycle >= ee.issue && cycle <= eeEnd) return ee;
+    let best = null;
+    let bestScore = Infinity;
+    for (let i = lo; i < evs.length; i++) {
+      const e = evs[i];
+      if (e.issue > cycle) break;
+      const s = eventSpan(e);
+      if (cycle > s.barStart + Math.max(1, s.barLen)) continue;
+      const score = Math.abs((e.depth || 0) - (depth || 0));
+      if (score < bestScore) {
+        bestScore = score;
+        best = e;
+        if (score === 0) break;
+      }
     }
-    return null;
+    return best;
   }
 
   function showTip(x, y, e) {
@@ -2357,12 +2448,15 @@
     const tIssue = t0 + stall;
     const exec = Math.max(0, dur - stall);
     const tEnd = t0 + dur;
+    const nSub = subRowsByLane[e.lane] || 1;
+    const sub = nSub > 1 ? `sub-row=${(e.depth || 0) + 1}/${nSub} (overlapping execution)\n` : "";
     tip.textContent =
       `${name}\n` +
       `${pc}\n` +
       `category=${e.cat}  raw=${CAT_NAMES[String(e.category)] || ""}\n` +
       `t0=${t0}  t_issue=${tIssue}  t_end=${tEnd}\n` +
       `duration=${dur}  stall=${stall}  exec(duration-stall)=${exec}\n` +
+      sub +
       `${CU_WORD}=${e.cu} simd=${e.simd} slot=${e.slot}`;
     tip.style.display = "block";
     const pad = 14;
@@ -2378,13 +2472,13 @@
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
-    const lane = Math.floor((y - TOP_PAD) / ROW_H);
-    if (lane < 0 || lane >= lanes) {
+    const lane = laneAtY(y);
+    if (lane < 0) {
       hideTip();
       return;
     }
     const cycle = cycleAtX(x);
-    const e = findEvent(lane, cycle);
+    const e = findEvent(lane, cycle, subRowAtY(lane, y));
     if (!e) {
       hideTip();
       return;
@@ -2419,10 +2513,10 @@
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
-    const lane = Math.floor((y - TOP_PAD) / ROW_H);
-    if (lane < 0 || lane >= lanes) return;
+    const lane = laneAtY(y);
+    if (lane < 0) return;
     const cycle = cycleAtX(x);
-    const e = findEvent(lane, cycle);
+    const e = findEvent(lane, cycle, subRowAtY(lane, y));
     if (!e) return;
     selected = { marker_id: e.marker_id, pc: e.pc, lane: e.lane, issue: e.issue };
     // ensure correct disasm is loaded
@@ -2440,10 +2534,10 @@
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const y = ev.clientY - rect.top + viewport.scrollTop;
-    const lane = Math.floor((y - TOP_PAD) / ROW_H);
-    if (lane < 0 || lane >= lanes) return;
+    const lane = laneAtY(y);
+    if (lane < 0) return;
     const cycle = cycleAtX(x);
-    const e = findEvent(lane, cycle);
+    const e = findEvent(lane, cycle, subRowAtY(lane, y));
     if (!e) return;
     selected = { marker_id: e.marker_id, pc: e.pc, lane: e.lane, issue: e.issue };
     if (e.marker_id && String(e.marker_id) !== String(currentMarkerId)) requestDisasm(e.marker_id);
