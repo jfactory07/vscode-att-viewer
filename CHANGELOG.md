@@ -4,6 +4,11 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Fix `gpuArch is not defined` aborting the open of any trace whose decoded JSON exceeds the
+  webview soft limit. The first decode succeeds and the event-capped second one then throws a
+  `ReferenceError`, because it still passed a variable that went away with the
+  `attViewer.gpuArch` setting. That call also dropped `rocprofilerSdkPath` and
+  `llvmObjdumpPath`, so the re-decode ignored both configured paths
 - Search the disassembly from the panel header or with Ctrl/Cmd+F. The query matches the
   instruction text and the `addr` column, matching substrings are highlighted in place and
   every matching line is tinted; Enter/Shift+Enter (or ↑/↓) step through the matches and wrap,

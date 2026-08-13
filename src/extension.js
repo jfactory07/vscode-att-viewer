@@ -295,9 +295,10 @@ async function openAttImpl(context, attUri, existingPanel = null) {
               att: attPath,
               resultsDb,
               codeobjDir: attDir,
-              gpuArch,
               out: outJson,
               maxEvents: effectiveMaxEvents,
+              rocprofilerSdkPath,
+              llvmObjdumpPath,
             }, env);
           }
         );
