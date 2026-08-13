@@ -4,6 +4,17 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Search the disassembly from the panel header or with Ctrl/Cmd+F. The query matches the
+  instruction text and the `addr` column, matching substrings are highlighted in place and
+  every matching line is tinted; Enter/Shift+Enter (or ↑/↓) step through the matches and wrap,
+  `Aa` matches case and `.*` switches to a regular expression. Matches are collected as line
+  indices and the highlight ranges are computed for visible rows only, so a query that hits
+  most of a large listing stays cheap. Searching does not filter rows or move the selection,
+  so the timeline, wait arrows and copy selection are unaffected
+- Restrict the disassembly search to instructions the trace actually sampled. The listing is
+  the whole code object, so a query like `tensorcnt` otherwise mostly lands in code the
+  dispatch never entered; the `all` toggle brings those lines back, and the match counter
+  turns yellow with a tooltip when it hid something
 - Label timeline rows by wave *slot* instead of `wave N`. A row is a wave slot on the single
   traced (CU/WGP, SIMD) and a slot hosts a new wave whenever the previous one retires, so the
   old label was wrong whenever a slot was reused. Row order is now sorted by

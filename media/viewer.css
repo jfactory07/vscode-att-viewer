@@ -30,7 +30,39 @@ html, body {
 .sourceBody { overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.4; padding: 10px; }
 .sourceBody.noPad { padding: 0; }
 .sourceBody:focus { outline: none; }
-.srcTabs { margin-left: auto; display: flex; gap: 6px; }
+#srcMeta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 40px; }
+.srcTabs { margin-left: auto; display: flex; gap: 6px; align-items: center; flex: 0 1 auto; min-width: 0; }
+.srcFind { display: flex; align-items: center; gap: 4px; margin-right: 4px; min-width: 0; }
+/* the box is the only part of the header that gives up width when the pane is narrow */
+.tabBtn, .findCount { flex: 0 0 auto; }
+.findInput {
+  flex: 1 1 150px;
+  width: 150px;
+  min-width: 60px;
+  background: #0f1012;
+  border: 1px solid rgba(255,255,255,0.22);
+  color: rgba(255,255,255,0.95);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.findInput:focus { outline: 1px solid rgba(255,255,255,0.30); }
+.findInput.invalid { border-color: rgba(255,90,80,0.75); }
+.findCount {
+  min-width: 40px;
+  text-align: right;
+  color: rgba(255,255,255,0.55);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+/* matches were hidden because those lines never ran; the tooltip says how many */
+.findCount.hasSkipped {
+  color: rgba(255, 200, 0, 0.75);
+  text-decoration: underline dotted rgba(255, 200, 0, 0.45);
+  text-underline-offset: 2px;
+  cursor: help;
+}
 .tabBtn {
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.14);
@@ -42,6 +74,9 @@ html, body {
 }
 .tabBtn.active { background: rgba(255,255,255,0.14); color: rgba(255,255,255,0.95); }
 .tabBtn:hover { background: rgba(255,255,255,0.10); }
+.tabBtn.iconBtn { padding: 3px 6px; line-height: 1.1; min-width: 22px; }
+.tabBtn:disabled { opacity: 0.35; cursor: default; }
+.tabBtn:disabled:hover { background: rgba(255,255,255,0.06); }
 
 .occTable { width: 100%; border-collapse: collapse; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; }
 .occTable thead th {
@@ -148,6 +183,19 @@ html, body {
 .disLayer { position: absolute; left: 0; right: 0; top: 0; }
 .disDataRow { cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .disDataRow:hover { background: rgba(255,255,255,0.06); }
+/* search hits sit below the selection styles, so a selected row keeps its own background */
+.disDataRow.searchHit { background: rgba(255, 200, 0, 0.07); }
+.disDataRow.searchCur { background: rgba(255, 200, 0, 0.16); outline: 1px solid rgba(255, 200, 0, 0.35); }
+.searchMark {
+  border-radius: 2px;
+  background: rgba(255, 200, 0, 0.30);
+  box-shadow: 0 0 0 1px rgba(255, 200, 0, 0.35);
+  color: rgba(255,255,255,0.98);
+}
+.disDataRow.searchCur .searchMark {
+  background: rgba(255, 160, 0, 0.60);
+  box-shadow: 0 0 0 1px rgba(255, 200, 90, 0.85);
+}
 /* copy range first, so the currently inspected instruction still wins the highlight */
 .disDataRow.rangeSel { background: rgba(64, 132, 235, 0.30); }
 .disDataRow.selected { background: rgba(255,255,255,0.16); outline: 1px solid rgba(255,255,255,0.22); }

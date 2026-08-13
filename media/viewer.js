@@ -47,6 +47,7 @@
       let sm = null;
       let lf = null;
       let rs = null;
+      let ds = null;
       try { v = view ? { min: view.min, max: view.max } : null; } catch { v = null; }
       try { cm = currentMarkerId; } catch { cm = null; }
       try { sel = selected; } catch { sel = null; }
@@ -57,6 +58,11 @@
           ? { key: regSel.key, focusLine: regSel.focusLine, atomsKey: Array.from(regSel.atoms || []).join(",") }
           : null;
       } catch { rs = null; }
+      try {
+        ds = disSearch
+          ? { query: disSearch.query, regex: disSearch.regex, icase: disSearch.icase, all: disSearch.all }
+          : null;
+      } catch { ds = null; }
 
       const st = {
         view: v,
@@ -67,6 +73,7 @@
         sourceMode: sm,
         occLaneFilter: lf,
         regSel: rs,
+        disSearch: ds,
       };
       setUiState(st);
     }, 180);
@@ -367,6 +374,17 @@
   // rebuilt from `disasmLines` rather than scraped from the DOM.
   let disRange = null; // { a:number, b:number } inclusive, unordered
   let disRangeVersion = 0;
+  // disasm search. Only the matching line indices are kept; the per-line match ranges are
+  // recomputed for the few visible rows, so a query that hits most of a large listing stays
+  // cheap. `cur` indexes into `lines`. The listing covers the whole code object, most of which
+  // never issued in the traced dispatch, so by default only sampled lines are searched and
+  // `skipped` counts the matches that were left out.
+  let disSearch = {
+    query: "", regex: false, icase: true, all: false,
+    invalid: false, lines: [], cur: -1, skipped: 0,
+  };
+  let disSearchSet = null; // Set of matching line indices, for O(1) lookup while rendering
+  let disSearchVersion = 0;
 
   function escapeHtml(s) {
     return String(s)
@@ -375,6 +393,37 @@
       .replaceAll(">", "&gt;")
       .replaceAll("\"", "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  // Wraps every [a,b) slice of `s` listed in `ranges` in a search-highlight span. Ranges are
+  // relative to `s`, sorted and non-overlapping.
+  function markRangesHtml(s, ranges) {
+    const str = String(s);
+    if (!ranges || ranges.length === 0) return escapeHtml(str);
+    let out = "";
+    let last = 0;
+    for (const r of ranges) {
+      const lo = Math.max(last, Math.min(str.length, r[0]));
+      const hi = Math.max(lo, Math.min(str.length, r[1]));
+      if (hi <= lo) continue;
+      if (lo > last) out += escapeHtml(str.slice(last, lo));
+      out += `<span class="searchMark">${escapeHtml(str.slice(lo, hi))}</span>`;
+      last = hi;
+    }
+    if (last < str.length) out += escapeHtml(str.slice(last));
+    return out;
+  }
+
+  // Same, for a sub-slice of `s`; `ranges` stay in whole-string coordinates.
+  function markSliceHtml(s, a, b, ranges) {
+    if (!ranges || ranges.length === 0) return escapeHtml(s.slice(a, b));
+    const local = [];
+    for (const r of ranges) {
+      const lo = Math.max(a, r[0]);
+      const hi = Math.min(b, r[1]);
+      if (hi > lo) local.push([lo - a, hi - a]);
+    }
+    return markRangesHtml(s.slice(a, b), local);
   }
 
   const _regTokenCache = new Map(); // token -> {atoms:Array<string>, key:string}
@@ -419,7 +468,7 @@
   // NOTE: do NOT use \b at end for array regs like v[0:3] (']' breaks \b)
   // We do manual boundary checks in renderAsmHtmlWithRegs.
   const REG_RE = /(?:[vsa]\[\d+:\d+\]|[vsa]\d+|ttmp\d+|vcc|exec|scc|m0)/g;
-  function renderAsmHtmlWithRegs(text, enableHighlightForLine) {
+  function renderAsmHtmlWithRegs(text, enableHighlightForLine, hlRanges) {
     const s = String(text || "");
     let out = "";
     let last = 0;
@@ -427,24 +476,24 @@
     while ((m = REG_RE.exec(s)) !== null) {
       const a = m.index;
       const b = a + m[0].length;
-      if (a > last) out += escapeHtml(s.slice(last, a));
+      if (a > last) out += markSliceHtml(s, last, a, hlRanges);
       const tok = m[0];
       // boundary check: avoid matching inside identifiers
       const pre = a > 0 ? s[a - 1] : "";
       const post = b < s.length ? s[b] : "";
       const isWord = (ch) => /[A-Za-z0-9_]/.test(ch);
       if ((pre && isWord(pre)) || (post && isWord(post))) {
-        out += escapeHtml(tok);
+        out += markSliceHtml(s, a, b, hlRanges);
         last = b;
         continue;
       }
       const info = atomsFromRegToken(tok);
       const isSel = !!(enableHighlightForLine && regSel && intersectsAtoms(info.atoms, regSel.atoms));
-      out += `<span class="regTok${isSel ? " sel" : ""}" data-regtok="${escapeHtml(tok)}">${escapeHtml(tok)}</span>`;
+      out += `<span class="regTok${isSel ? " sel" : ""}" data-regtok="${escapeHtml(tok)}">${markSliceHtml(s, a, b, hlRanges)}</span>`;
       last = b;
     }
-    if (last < s.length) out += escapeHtml(s.slice(last));
-    return out || escapeHtml(s);
+    if (last < s.length) out += markSliceHtml(s, last, s.length, hlRanges);
+    return out || markSliceHtml(s, 0, s.length, hlRanges);
   }
 
   function mnemOfLineText(text) {
@@ -661,9 +710,52 @@
   let tabDisasmBtn = null;
   let tabOccBtn = null;
   let copyBtn = null;
+  let findInput = null;
+  let findWrap = null;
+  let findCountEl = null;
+  let findPrevBtn = null;
+  let findNextBtn = null;
+  let findCaseBtn = null;
+  let findReBtn = null;
+  let findAllBtn = null;
   if (sourceHeader) {
     const tabs = document.createElement("div");
     tabs.className = "srcTabs";
+
+    findWrap = document.createElement("div");
+    findWrap.className = "srcFind";
+    findInput = document.createElement("input");
+    findInput.className = "findInput";
+    findInput.type = "text";
+    findInput.spellcheck = false;
+    findInput.placeholder = "Find instruction";
+    findInput.title =
+      "Search the disassembly (Ctrl/Cmd+F), matching the instruction text and the addr column.\n" +
+      "Enter = next match, Shift+Enter = previous, Esc = clear.";
+    findWrap.appendChild(findInput);
+    const mkFindBtn = (text, title) => {
+      const b = document.createElement("button");
+      b.className = "tabBtn iconBtn";
+      b.textContent = text;
+      b.title = title;
+      findWrap.appendChild(b);
+      return b;
+    };
+    findCaseBtn = mkFindBtn("Aa", "Match case");
+    findReBtn = mkFindBtn(".*", "Use a regular expression, e.g. ^v_mfma or s_wait_.*cnt");
+    findAllBtn = mkFindBtn(
+      "all",
+      "Also match instructions the trace never sampled (total = 0).\n" +
+        "Off by default: the listing is the whole code object, most of which the dispatch never ran."
+    );
+    findCountEl = document.createElement("span");
+    findCountEl.className = "findCount";
+    findCountEl.title = "current match / matching lines";
+    findWrap.appendChild(findCountEl);
+    findPrevBtn = mkFindBtn("↑", "Previous match (Shift+Enter)");
+    findNextBtn = mkFindBtn("↓", "Next match (Enter)");
+    tabs.appendChild(findWrap);
+
     copyBtn = document.createElement("button");
     copyBtn.className = "tabBtn";
     copyBtn.textContent = "Copy";
@@ -696,10 +788,52 @@
       if (selected) renderOccurrences(selected.marker_id, selected.pc);
     }
     updateCopyBtn();
+    updateFindUI();
   }
   if (tabDisasmBtn) tabDisasmBtn.addEventListener("click", () => setSourceMode("disasm"));
   if (tabOccBtn) tabOccBtn.addEventListener("click", () => setSourceMode("occ"));
   if (copyBtn) copyBtn.addEventListener("click", () => copySelection("addr"));
+  if (findInput) {
+    findInput.addEventListener("input", () => {
+      disSearch.query = findInput.value;
+      scheduleDisSearch();
+    });
+    findInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        flushDisSearch();
+        disSearchGo(ev.shiftKey ? -1 : 1);
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        clearDisSearch();
+      }
+    });
+  }
+  // The buttons hand focus back to the box so Enter/Shift+Enter keep stepping through matches.
+  const refocusFind = () => { if (findInput) findInput.focus(); };
+  if (findPrevBtn) findPrevBtn.addEventListener("click", () => { disSearchGo(-1); refocusFind(); });
+  if (findNextBtn) findNextBtn.addEventListener("click", () => { disSearchGo(1); refocusFind(); });
+  if (findCaseBtn) {
+    findCaseBtn.addEventListener("click", () => {
+      disSearch.icase = !disSearch.icase;
+      runDisSearch();
+      refocusFind();
+    });
+  }
+  if (findReBtn) {
+    findReBtn.addEventListener("click", () => {
+      disSearch.regex = !disSearch.regex;
+      runDisSearch();
+      refocusFind();
+    });
+  }
+  if (findAllBtn) {
+    findAllBtn.addEventListener("click", () => {
+      disSearch.all = !disSearch.all;
+      runDisSearch();
+      refocusFind();
+    });
+  }
 
   // ---------------------------------------------------------------------------
   // Disasm selection + copy
@@ -928,8 +1062,9 @@
 
   function onDisMouseDown(ev) {
     if (ev.button !== 0 || sourceMode !== "disasm") return;
-    // register tokens keep their own click-to-highlight behavior
-    if (ev.target && ev.target.classList && ev.target.classList.contains("regTok")) return;
+    // register tokens keep their own click-to-highlight behavior. A search mark can nest
+    // inside the token span, so match the ancestor rather than the event target itself.
+    if (ev.target && ev.target.closest && ev.target.closest(".regTok")) return;
     const idx = disLineFromPointer(ev.clientY);
     if (idx == null) return;
     suppressRowClick = false;
@@ -1003,6 +1138,12 @@
       return;
     }
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+    // Find works from anywhere in the panel, including right after clicking the timeline.
+    if (String(ev.key || "").toLowerCase() === "f") {
+      ev.preventDefault();
+      focusFind();
+      return;
+    }
     if (sourceMode !== "disasm" || !srcPaneHasFocus()) return;
     const k = String(ev.key || "").toLowerCase();
     if (k === "c") {
@@ -1016,6 +1157,232 @@
       selectAllDisasm();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Disasm search
+  // ---------------------------------------------------------------------------
+
+  // A literal query is matched with indexOf rather than a regex so that operand syntax
+  // (`v[0:3]`, `s_add_u32 s0, s0, 4`) needs no escaping.
+  function disSearchMatcher() {
+    if (!disSearch.query) return null;
+    if (disSearch.regex) {
+      try {
+        return { re: new RegExp(disSearch.query, disSearch.icase ? "gi" : "g") };
+      } catch {
+        return { bad: true };
+      }
+    }
+    return { needle: disSearch.icase ? disSearch.query.toLowerCase() : disSearch.query };
+  }
+
+  // Cap the marks on one line; a pathological regex can otherwise match at every position.
+  const DIS_SEARCH_MAX_MARKS = 64;
+
+  function disSearchRangesIn(m, s) {
+    const out = [];
+    const str = String(s || "");
+    if (!m || m.bad || !str) return out;
+    if (m.needle) {
+      const hay = disSearch.icase ? str.toLowerCase() : str;
+      let from = 0;
+      while (out.length < DIS_SEARCH_MAX_MARKS) {
+        const i = hay.indexOf(m.needle, from);
+        if (i < 0) break;
+        out.push([i, i + m.needle.length]);
+        from = i + m.needle.length;
+      }
+      return out;
+    }
+    m.re.lastIndex = 0;
+    let mm;
+    while ((mm = m.re.exec(str)) !== null && out.length < DIS_SEARCH_MAX_MARKS) {
+      const a = mm.index;
+      const b = a + mm[0].length;
+      if (b > a) out.push([a, b]);
+      // an empty match would spin forever on the same index
+      m.re.lastIndex = b > a ? b : a + 1;
+    }
+    return out;
+  }
+
+  function disSearchTestsAgainst(m, str) {
+    if (m.needle) {
+      const hay = disSearch.icase ? String(str).toLowerCase() : String(str);
+      return hay.includes(m.needle);
+    }
+    m.re.lastIndex = 0;
+    return m.re.test(String(str));
+  }
+
+  function disSearchTest(m, lineIdx) {
+    const ln = disasmLines[lineIdx];
+    if (!ln) return false;
+    if (disSearchTestsAgainst(m, ln.text || "")) return true;
+    return disSearchTestsAgainst(m, disasmAddrText(ln.addr));
+  }
+
+  // A line "ran" when the trace holds at least one sample for it in the current code object.
+  // The listing is the whole object, so without this most hits are in code the dispatch never
+  // entered.
+  function disLineExecuted(ln) {
+    if (!ln) return false;
+    const hit = pcIndex.get(`${currentMarkerId}|${Number(ln.addr)}`);
+    return !!(hit && hit.idxs && hit.idxs.length);
+  }
+
+  // Ranges to mark on one line, or null when the line does not match.
+  function disSearchHits(m, lineIdx) {
+    const ln = disasmLines[lineIdx];
+    if (!ln) return null;
+    const text = disSearchRangesIn(m, ln.text || "");
+    const addr = disSearchRangesIn(m, disasmAddrText(ln.addr));
+    if (text.length === 0 && addr.length === 0) return null;
+    return { text, addr };
+  }
+
+  // Rows live inside `disBody`, which sits below the sticky column header.
+  function disBodyOffset() {
+    const body = srcBody && srcBody._disBodyEl;
+    if (!body || !srcBody) return 0;
+    return body.getBoundingClientRect().top - srcBody.getBoundingClientRect().top + srcBody.scrollTop;
+  }
+
+  function firstVisibleDisLine() {
+    if (!srcBody) return 0;
+    const rowH = srcBody._disRowH || 20;
+    return Math.max(0, Math.floor((srcBody.scrollTop - disBodyOffset()) / rowH));
+  }
+
+  // Leaves the scroll position alone when the row is already on screen, so that typing does
+  // not make the listing jump around on every keystroke.
+  function revealDisLine(lineIdx) {
+    if (!srcBody || lineIdx == null) return;
+    const rowH = srcBody._disRowH || 20;
+    const top = disBodyOffset() + Number(lineIdx) * rowH;
+    // the sticky header hides the top row's worth of the viewport
+    const visTop = srcBody.scrollTop + rowH;
+    const visBot = srcBody.scrollTop + srcBody.clientHeight;
+    if (top < visTop || top + rowH > visBot) {
+      srcBody.scrollTop = Math.max(0, top - Math.max(rowH * 2, srcBody.clientHeight * 0.4));
+    }
+    if (srcBody._updateDis) srcBody._updateDis();
+  }
+
+  function currentDisSearchLine() {
+    if (disSearch.cur < 0) return -1;
+    const l = disSearch.lines[disSearch.cur];
+    return l == null ? -1 : Number(l);
+  }
+
+  function recomputeDisSearch() {
+    const prevLine = currentDisSearchLine();
+    const m = disSearchMatcher();
+    disSearch.invalid = !!(m && m.bad);
+    const lines = [];
+    let skipped = 0;
+    if (m && !m.bad) {
+      for (let i = 0; i < disasmLines.length; i++) {
+        if (!disSearchTest(m, i)) continue;
+        if (!disSearch.all && !disLineExecuted(disasmLines[i])) {
+          skipped++;
+          continue;
+        }
+        lines.push(i);
+      }
+    }
+    disSearch.skipped = skipped;
+    disSearch.lines = lines;
+    disSearchSet = lines.length ? new Set(lines) : null;
+    if (lines.length === 0) {
+      disSearch.cur = -1;
+    } else {
+      // stay on the match the user was on, else take the first one at or below the viewport
+      const anchor = prevLine >= 0 ? prevLine : firstVisibleDisLine();
+      let k = 0;
+      while (k < lines.length - 1 && lines[k] < anchor) k++;
+      disSearch.cur = k;
+    }
+    disSearchVersion++;
+    updateFindUI();
+    if (srcBody && srcBody._updateDis) srcBody._updateDis();
+  }
+
+  let _disSearchTimer = null;
+  function scheduleDisSearch() {
+    if (_disSearchTimer) clearTimeout(_disSearchTimer);
+    _disSearchTimer = setTimeout(() => {
+      _disSearchTimer = null;
+      runDisSearch();
+    }, 90);
+  }
+
+  function flushDisSearch() {
+    if (!_disSearchTimer) return;
+    clearTimeout(_disSearchTimer);
+    _disSearchTimer = null;
+    runDisSearch();
+  }
+
+  function runDisSearch() {
+    recomputeDisSearch();
+    const line = currentDisSearchLine();
+    if (line >= 0) revealDisLine(line);
+    scheduleSaveUiState();
+  }
+
+  function disSearchGo(delta) {
+    if (!disSearch.lines.length) return;
+    const n = disSearch.lines.length;
+    disSearch.cur = disSearch.cur < 0 ? 0 : (((disSearch.cur + delta) % n) + n) % n;
+    disSearchVersion++;
+    updateFindUI();
+    revealDisLine(disSearch.lines[disSearch.cur]);
+  }
+
+  function clearDisSearch() {
+    if (_disSearchTimer) {
+      clearTimeout(_disSearchTimer);
+      _disSearchTimer = null;
+    }
+    if (findInput) findInput.value = "";
+    disSearch.query = "";
+    recomputeDisSearch();
+    if (srcBody) {
+      try { srcBody.focus({ preventScroll: true }); } catch { srcBody.focus(); }
+    }
+  }
+
+  function focusFind() {
+    if (sourceMode !== "disasm") setSourceMode("disasm");
+    if (!findInput) return;
+    findInput.focus();
+    findInput.select();
+  }
+
+  function updateFindUI() {
+    if (!findWrap) return;
+    findWrap.style.display = sourceMode === "disasm" ? "" : "none";
+    if (findCaseBtn) findCaseBtn.classList.toggle("active", !disSearch.icase);
+    if (findReBtn) findReBtn.classList.toggle("active", disSearch.regex);
+    if (findAllBtn) findAllBtn.classList.toggle("active", disSearch.all);
+    if (findInput) findInput.classList.toggle("invalid", !!disSearch.invalid);
+    if (findCountEl) {
+      let txt = "";
+      if (disSearch.invalid) txt = "bad re";
+      else if (disSearch.query) txt = disSearch.lines.length ? `${disSearch.cur + 1}/${disSearch.lines.length}` : "0";
+      findCountEl.textContent = txt;
+      findCountEl.classList.toggle("hasSkipped", !disSearch.all && disSearch.skipped > 0);
+      findCountEl.title = disSearch.all
+        ? "current match / matching lines"
+        : disSearch.skipped
+          ? `current match / matching lines that ran.\n${disSearch.skipped} more line${disSearch.skipped === 1 ? "" : "s"} match but were never sampled — use "all" to include them.`
+          : "current match / matching lines that ran";
+    }
+    const none = disSearch.lines.length === 0;
+    if (findPrevBtn) findPrevBtn.disabled = none;
+    if (findNextBtn) findNextBtn.disabled = none;
+  }
 
   function requestDisasm(markerId) {
     const p = codeobjFiles[String(markerId)];
@@ -1034,6 +1401,10 @@
       // a different code object was loaded; line indices no longer mean anything
       disRange = null;
       disRangeVersion++;
+      disSearch.lines = [];
+      disSearch.cur = -1;
+      disSearchSet = null;
+      disSearchVersion++;
     }
     disasmLines = nextLines;
     disasmAddrToEl = new Map();
@@ -1226,6 +1597,7 @@
     let lastRegVer = -1;
     let lastWaitVer = -1;
     let lastRangeVer = -1;
+    let lastSearchVer = -1;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -1255,12 +1627,17 @@
       const count = Math.min(disasmLines.length - first, Math.ceil(viewH / ROW_H) + overscan * 2);
       // Wait links are attached to disBody and scroll naturally with rows.
       if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion
-        && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion) return;
+        && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion
+        && lastSearchVer === disSearchVersion) return;
       lastFirst = first; lastCount = count;
       lastRegVer = regSelVersion;
       lastWaitVer = waitSelVersion;
       lastRangeVer = disRangeVersion;
+      lastSearchVer = disSearchVersion;
       const range = disRangeBounds();
+      // Match ranges are computed here, for visible rows only.
+      const searchM = disSearchSet ? disSearchMatcher() : null;
+      const searchCurLine = currentDisSearchLine();
       ensurePool(count);
       for (let i = 0; i < pool.length; i++) {
         const row = pool[i];
@@ -1281,6 +1658,9 @@
 
         row.classList.toggle("selected", selected && selected.marker_id === currentMarkerId && selected.pc === pc);
         row.classList.toggle("rangeSel", !!range && idx >= range.lo && idx <= range.hi);
+        const searchHits = searchM && disSearchSet.has(idx) ? disSearchHits(searchM, idx) : null;
+        row.classList.toggle("searchHit", !!searchHits);
+        row.classList.toggle("searchCur", !!searchHits && idx === searchCurLine);
         const isWaitFrom = !!(waitSel && Number(idx) === Number(waitSel.fromLine));
         const waitTargetOfCls = (cls) => (
           waitSel && waitSel.targets
@@ -1299,11 +1679,11 @@
         const cells = row.children;
         cells[0].className = "disCell disAddrCell";
         {
-          const addr = "0x" + pc.toString(16).padStart(4, "0");
+          const addr = disasmAddrText(pc);
           let badges = "";
           if (waitTlgkm) badges += ` <span class="waitBadge lgkm">${escapeHtml(waitTlgkm.label)}</span>`;
           if (waitTvm) badges += ` <span class="waitBadge vm">${escapeHtml(waitTvm.label)}</span>`;
-          cells[0].innerHTML = escapeHtml(addr) + badges;
+          cells[0].innerHTML = markRangesHtml(addr, searchHits ? searchHits.addr : null) + badges;
         }
         cells[1].className = "disCell disTextCell";
         // Highlight selected register occurrences in the selected line, as well as:
@@ -1311,7 +1691,8 @@
         // - following lines up to REG_HL_FORWARD_LINES (bounded for performance)
         let txtHtml = renderAsmHtmlWithRegs(
           ln.text,
-          !!(regSel && Number(idx) <= (Number(regSel.focusLine) + REG_HL_FORWARD_LINES))
+          !!(regSel && Number(idx) <= (Number(regSel.focusLine) + REG_HL_FORWARD_LINES)),
+          searchHits ? searchHits.text : null
         );
         if (isWaitFrom && waitSel && waitSel.targets && waitSel.targets.length) {
           const parts = waitSel.targets.map((t) => {
@@ -1335,8 +1716,9 @@
         if (!row._bound) {
           row.addEventListener("click", (ev) => {
             // if clicking a register token, select/highlight registers (do not change selected instruction)
-            if (ev && ev.target && ev.target.classList && ev.target.classList.contains("regTok")) {
-              const tok = ev.target.getAttribute("data-regtok") || "";
+            const regEl = ev && ev.target && ev.target.closest ? ev.target.closest(".regTok") : null;
+            if (regEl) {
+              const tok = regEl.getAttribute("data-regtok") || "";
               const lineIdx = Number(row.dataset.line || "0");
               const info = atomsFromRegToken(tok);
               const nextKey = `${lineIdx}|${info.key}`;
@@ -1391,9 +1773,10 @@
     srcBody._disRowH = ROW_H;
     srcBody._updateDis = updateVisible;
 
-    // recompute wait arrows when disasm changes
+    // recompute wait arrows and search matches when disasm changes
     updateWaitSelFromSelected();
     requestWaitLinks();
+    recomputeDisSearch();
     updateVisible();
     updateCopyBtn();
   }
@@ -1577,6 +1960,16 @@
   }
   let best = null, bestN = -1;
   for (const [k, n] of markerCount.entries()) { if (n > bestN) { bestN = n; best = k; } }
+  // Restore the search box; the matches themselves are recomputed once the disasm arrives.
+  if (SAVED_UI_STATE && SAVED_UI_STATE.disSearch) {
+    const _ds = SAVED_UI_STATE.disSearch;
+    disSearch.query = typeof _ds.query === "string" ? _ds.query : "";
+    disSearch.regex = !!_ds.regex;
+    disSearch.icase = _ds.icase !== false;
+    disSearch.all = !!_ds.all;
+    if (findInput) findInput.value = disSearch.query;
+  }
+  updateFindUI();
   // Restore current code object and selection if present
   if (SAVED_UI_STATE && SAVED_UI_STATE.currentMarkerId != null) {
     requestDisasm(SAVED_UI_STATE.currentMarkerId);
