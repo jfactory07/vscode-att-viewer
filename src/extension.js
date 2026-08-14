@@ -57,6 +57,9 @@ const WEBVIEW_JSON_SOFT_LIMIT_BYTES = 48 * 1024 * 1024;
 const AUTO_MAX_EVENTS_DEFAULT = 250000;
 const AUTO_MAX_EVENTS_MIN = 50000;
 const AUTO_MAX_EVENTS_MAX = 500000;
+// A HIP source file the panel will show. Kernel headers run to a few thousand lines; anything
+// this size is not source the reader meant to open.
+const SOURCE_MAX_BYTES = 8 * 1024 * 1024;
 
 function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
   const scriptUri = webview.asWebviewUri(
@@ -337,6 +340,12 @@ async function openAttImpl(context, attUri, existingPanel = null) {
 
   // In-panel disassembly cache
   const disasmCache = new Map();
+  // Source paths named by the line tables we have parsed. The webview asks the host to read
+  // HIP files by path, so answer only for files a code object actually points at.
+  const knownSourceFiles = new Set();
+  const rememberSourceFiles = (lines) => {
+    for (const ln of lines) if (ln.file) knownSourceFiles.add(ln.file);
+  };
 
   // Persisted color config (global across traces)
   const getSavedColors = () => context.globalState.get("attViewer.colors", null);
@@ -385,6 +394,7 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       try {
         const lines = await runObjdump(llvmObjdumpPath, codeobjPath);
         disasmCache.set(codeobjPath, lines);
+        rememberSourceFiles(lines);
         panel.webview.postMessage({
           type: "disasm",
           markerId: msg.markerId,
@@ -398,6 +408,33 @@ async function openAttImpl(context, attUri, existingPanel = null) {
           codeobjPath,
           error: String(e && e.message ? e.message : e),
         });
+      }
+    } else if (msg.type === "requestSource") {
+      const srcPath = String(msg.path || "");
+      const fail = (error) =>
+        panel.webview.postMessage({ type: "sourceError", path: srcPath, error });
+      if (!srcPath || !knownSourceFiles.has(srcPath)) {
+        fail("not referenced by this code object");
+        return;
+      }
+      try {
+        const st = fs.statSync(srcPath);
+        if (!st.isFile()) {
+          fail("not a file");
+          return;
+        }
+        if (st.size > SOURCE_MAX_BYTES) {
+          fail(`too large (${(st.size / 1048576).toFixed(1)} MiB)`);
+          return;
+        }
+        panel.webview.postMessage({
+          type: "source",
+          path: srcPath,
+          text: fs.readFileSync(srcPath, "utf8"),
+        });
+      } catch (e) {
+        // The usual case is a code object built on another machine, or a moved checkout.
+        fail(String(e && e.message ? e.message : e));
       }
     }
   });
@@ -415,7 +452,9 @@ async function openAttImpl(context, attUri, existingPanel = null) {
 
 function runObjdump(objdump, codeobjPath) {
   return new Promise((resolve, reject) => {
-    const args = ["-d", codeobjPath];
+    // --line-numbers interleaves "; /path/file.h:539" before each run of instructions that
+    // came from that source line, and costs nothing when the code object carries no DWARF.
+    const args = ["-d", "--line-numbers", codeobjPath];
     const p = spawn(objdump, args, { env: process.env });
     let out = "";
     let err = "";
@@ -427,14 +466,36 @@ function runObjdump(objdump, codeobjPath) {
       // Parse lines with trailing address comments: // 000000004450:
       const lines = [];
       const re = /\/\/\s+([0-9A-Fa-f]+):/;
+      // "; <mangled>():" marks a function, "; <path>:<line>" a source position. Only the
+      // latter carries a colon-separated decimal tail, so match that and let the rest through.
+      const posRe = /^;\s+(\S.*):(\d+)$/;
+      let curFile = "";
+      let curLine = 0;
       for (const ln of out.split(/\r?\n/)) {
+        if (ln.startsWith(";")) {
+          const pm = ln.match(posRe);
+          if (pm) {
+            curFile = pm[1];
+            curLine = parseInt(pm[2], 10);
+          } else if (ln.endsWith("():")) {
+            // A new function: do not let its first instructions inherit the previous position.
+            curFile = "";
+            curLine = 0;
+          }
+          continue;
+        }
         if (!ln.includes("//")) continue;
         const m = ln.match(re);
         if (!m) continue;
         const addr = parseInt(m[1], 16);
         const text = ln.split("//", 1)[0].trim();
         if (!text || text.endsWith(":")) continue;
-        lines.push({ addr, text });
+        const row = { addr, text };
+        if (curFile) {
+          row.file = curFile;
+          row.line = curLine;
+        }
+        lines.push(row);
       }
       resolve(lines);
     });
@@ -483,5 +544,7 @@ function runPython(pythonExe, scriptPath, args, env) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+// runObjdump is exported so the listing parser can be tested against a real code object
+// without a VS Code host.
+module.exports = { activate, deactivate, runObjdump };
 

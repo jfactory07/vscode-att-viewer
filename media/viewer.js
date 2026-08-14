@@ -64,6 +64,11 @@
           : null;
       } catch { ds = null; }
 
+      let hp = null;
+      try {
+        hp = { open: hipOpen, file: hipFile, w: hipW, sel: hipSel };
+      } catch { hp = null; }
+
       const st = {
         view: v,
         viewportScrollTop: viewport ? viewport.scrollTop : 0,
@@ -74,6 +79,7 @@
         occLaneFilter: lf,
         regSel: rs,
         disSearch: ds,
+        hip: hp,
       };
       setUiState(st);
     }, 180);
@@ -427,7 +433,7 @@
 
   // ---- source/disassembly pane ----
   let currentMarkerId = null;
-  let disasmLines = []; // [{addr,text}]
+  let disasmLines = []; // [{addr,text,file?,line?}]
   let disasmAddrToEl = new Map();
   let selected = null; // { marker_id, pc, lane, issue }
   let sourceMode = "disasm"; // "disasm" | "occ"
@@ -455,6 +461,20 @@
     query: "", regex: false, icase: true, all: false,
     invalid: false, lines: [], cur: -1, skipped: 0,
   };
+  // HIP source pane, to the right of the listing. Every position comes from the code object's
+  // DWARF line table, so the pane stays unavailable for one built without -gline-tables-only.
+  let hipOpen = false;
+  let hipW = 460; // pane width in px
+  let hipFile = ""; // file on show
+  let hipLines = null; // its text split into lines, null while the host is reading it
+  let hipError = "";
+  let hipSel = null; // { file, line } picked in the pane; tints the instructions it compiled to
+  let hipSelVersion = 0;
+  let hipCur = null; // { file, line } the pane is pointed at, from the last instruction followed
+  const hipTextCache = new Map(); // path -> string[]
+  let srcLineIndex = new Map(); // "file|line" -> ascending disasm row indices
+  let srcFiles = []; // [{ file, count }], most instructions first
+  const HIP_ROW_H = 18;
   let disSearchSet = null; // Set of matching line indices, for O(1) lookup while rendering
   let disSearchVersion = 0;
 
@@ -779,6 +799,13 @@
   }
 
   const sourceHeader = srcMeta ? srcMeta.parentElement : null;
+  const sourcePane = sourceHeader ? sourceHeader.parentElement : null;
+  let hipBtn = null;
+  let hipPane = null;
+  let hipDivider = null;
+  let hipBody = null;
+  let hipFileSel = null;
+  let hipMetaEl = null;
   let tabDisasmBtn = null;
   let tabOccBtn = null;
   let copyBtn = null;
@@ -842,9 +869,319 @@
     tabOccBtn = document.createElement("button");
     tabOccBtn.className = "tabBtn";
     tabOccBtn.textContent = "Occurrences";
+    hipBtn = document.createElement("button");
+    hipBtn.className = "tabBtn";
+    hipBtn.textContent = "HIP";
+    tabs.appendChild(hipBtn);
+    hipBtn.addEventListener("click", () => setHipOpen(!hipOpen));
     tabs.appendChild(tabDisasmBtn);
     tabs.appendChild(tabOccBtn);
     sourceHeader.appendChild(tabs);
+  }
+
+  // ---- HIP source pane ----
+  //
+  // .sourcePane is a two-row grid (header, body); opening the pane turns it into a two-column
+  // one and drops the divider and the pane into the new column, so the listing keeps its own
+  // DOM untouched and closing the pane costs nothing.
+  function buildSrcIndex() {
+    srcLineIndex = new Map();
+    const per = new Map();
+    for (let i = 0; i < disasmLines.length; i++) {
+      const ln = disasmLines[i];
+      if (!ln.file) continue;
+      const k = `${ln.file}|${ln.line}`;
+      let a = srcLineIndex.get(k);
+      if (!a) srcLineIndex.set(k, (a = []));
+      a.push(i);
+      per.set(ln.file, (per.get(ln.file) || 0) + 1);
+    }
+    srcFiles = [...per.entries()]
+      .map(([file, count]) => ({ file, count }))
+      .sort((a, b) => b.count - a.count || (a.file < b.file ? -1 : 1));
+  }
+
+  function hasLineInfo() {
+    return srcFiles.length > 0;
+  }
+
+  function baseName(p) {
+    const s = String(p || "");
+    const i = s.lastIndexOf("/");
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  function ensureHipDom() {
+    if (hipPane || !sourcePane) return;
+    hipDivider = document.createElement("div");
+    hipDivider.className = "vdivider";
+    hipDivider.title = "Drag to resize the HIP source pane";
+    hipPane = document.createElement("div");
+    hipPane.className = "hipPane";
+
+    const head = document.createElement("div");
+    head.className = "hipHeader";
+    hipFileSel = document.createElement("select");
+    hipFileSel.className = "hipFileSel";
+    hipFileSel.title = "Source files this code object was compiled from";
+    hipFileSel.addEventListener("change", () => showHipFile(hipFileSel.value));
+    head.appendChild(hipFileSel);
+    hipMetaEl = document.createElement("span");
+    hipMetaEl.className = "hipMeta";
+    head.appendChild(hipMetaEl);
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "tabBtn iconBtn";
+    closeBtn.textContent = "×";
+    closeBtn.title = "Close the HIP source pane";
+    closeBtn.addEventListener("click", () => setHipOpen(false));
+    head.appendChild(closeBtn);
+
+    hipBody = document.createElement("div");
+    hipBody.className = "hipBody";
+    hipBody.addEventListener("click", (ev) => {
+      const row = ev.target && ev.target.closest ? ev.target.closest(".hipRow") : null;
+      // A line that compiled to nothing has nothing to point at, so leave it inert.
+      if (!row || !row.classList.contains("hasAsm")) return;
+      selectHipLine(Number(row.dataset.line));
+    });
+
+    hipPane.appendChild(head);
+    hipPane.appendChild(hipBody);
+    sourcePane.appendChild(hipDivider);
+    sourcePane.appendChild(hipPane);
+    bindHipDivider();
+  }
+
+  function bindHipDivider() {
+    let dragging = false;
+    hipDivider.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      ev.preventDefault();
+    });
+    window.addEventListener("mousemove", (ev) => {
+      if (!dragging || !sourcePane) return;
+      const r = sourcePane.getBoundingClientRect();
+      // Leave the listing at least a third of the pane; it is still the primary view.
+      hipW = Math.max(220, Math.min(r.width * 0.67, r.right - ev.clientX));
+      applyHipLayout();
+      scheduleSaveUiState();
+    });
+    window.addEventListener("mouseup", () => {
+      dragging = false;
+    });
+  }
+
+  function applyHipLayout() {
+    if (!sourcePane) return;
+    sourcePane.classList.toggle("withHip", hipOpen);
+    sourcePane.style.setProperty("--hipW", `${Math.round(hipW)}px`);
+    if (hipPane) hipPane.style.display = hipOpen ? "" : "none";
+    if (hipDivider) hipDivider.style.display = hipOpen ? "" : "none";
+  }
+
+  function updateHipBtn() {
+    if (!hipBtn) return;
+    const on = hasLineInfo();
+    hipBtn.disabled = !on;
+    hipBtn.classList.toggle("active", hipOpen && on);
+    hipBtn.title = on
+      ? "Show the HIP source next to the listing.\n" +
+        "Click an instruction to reach its source line; click a source line to mark every " +
+        "instruction it compiled to."
+      : "This code object carries no DWARF line table, so no instruction can be traced back to " +
+        "HIP. Rebuild with -gline-tables-only (in hipconv: -DHIPCONV_LINE_TABLES=ON) and profile " +
+        "again.";
+  }
+
+  function setHipOpen(open) {
+    if (open && !hasLineInfo()) return;
+    hipOpen = !!open;
+    if (hipOpen) {
+      ensureHipDom();
+      // Default to the file most of the code came from, usually the kernel header.
+      if (!hipFile && srcFiles.length) showHipFile(srcFiles[0].file);
+      else renderHipFileSel();
+      syncHipToSelected();
+    }
+    applyHipLayout();
+    updateHipBtn();
+    scheduleSaveUiState();
+  }
+
+  function renderHipFileSel() {
+    if (!hipFileSel) return;
+    hipFileSel.innerHTML = "";
+    for (const f of srcFiles) {
+      const opt = document.createElement("option");
+      opt.value = f.file;
+      opt.textContent = `${baseName(f.file)}  (${f.count})`;
+      opt.title = f.file;
+      hipFileSel.appendChild(opt);
+    }
+    hipFileSel.value = hipFile;
+    hipFileSel.title = hipFile || "Source files this code object was compiled from";
+  }
+
+  function showHipFile(pathStr) {
+    const p = String(pathStr || "");
+    if (!p) return;
+    hipFile = p;
+    hipError = "";
+    renderHipFileSel();
+    const cached = hipTextCache.get(p);
+    if (cached) {
+      hipLines = cached;
+      renderHipBody();
+      return;
+    }
+    hipLines = null;
+    renderHipBody();
+    vscode.postMessage({ type: "requestSource", path: p });
+  }
+
+  function onSourceText(pathStr, text) {
+    const lines = String(text == null ? "" : text).split(/\r?\n/);
+    hipTextCache.set(pathStr, lines);
+    if (pathStr !== hipFile) return;
+    hipLines = lines;
+    hipError = "";
+    renderHipBody();
+    if (hipCur && hipCur.file === hipFile) {
+      scrollHipTo(hipCur.line);
+      paintHipMarks();
+    }
+  }
+
+  function onSourceError(pathStr, error) {
+    if (pathStr !== hipFile) return;
+    hipLines = null;
+    hipError = String(error || "unavailable");
+    renderHipBody();
+  }
+
+  // Rows are plain and fixed height, so scrolling to a line is arithmetic and a whole kernel
+  // header stays cheap to hold in the DOM.
+  function renderHipBody() {
+    if (!hipBody) return;
+    hipBody.innerHTML = "";
+    if (hipMetaEl) hipMetaEl.textContent = "";
+    if (hipError) {
+      const m = document.createElement("div");
+      m.className = "hipNote";
+      m.textContent = `Cannot read ${hipFile}: ${hipError}`;
+      hipBody.appendChild(m);
+      return;
+    }
+    if (!hipLines) {
+      const m = document.createElement("div");
+      m.className = "hipNote";
+      m.textContent = "Loading…";
+      hipBody.appendChild(m);
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < hipLines.length; i++) {
+      const lineNo = i + 1;
+      const idxs = srcLineIndex.get(`${hipFile}|${lineNo}`);
+      const row = document.createElement("div");
+      row.className = "hipRow";
+      row.dataset.line = String(lineNo);
+      row.style.height = `${HIP_ROW_H}px`;
+      if (idxs) {
+        row.classList.add("hasAsm");
+        row.title = `${idxs.length} instruction${idxs.length === 1 ? "" : "s"}`;
+      }
+      const num = document.createElement("div");
+      num.className = "hipNum";
+      num.textContent = String(lineNo);
+      const txt = document.createElement("div");
+      txt.className = "hipTxt";
+      txt.textContent = hipLines[i];
+      row.appendChild(num);
+      row.appendChild(txt);
+      frag.appendChild(row);
+    }
+    hipBody.appendChild(frag);
+    const n = srcFiles.find((f) => f.file === hipFile);
+    if (hipMetaEl) hipMetaEl.textContent = n ? `${n.count} instr` : "";
+    paintHipMarks();
+  }
+
+  function hipRowAt(lineNo) {
+    if (!hipBody) return null;
+    return hipBody.querySelector(`.hipRow[data-line="${lineNo}"]`);
+  }
+
+  // The pane marks two lines: the one the instruction last followed came from, and the one the
+  // reader clicked here (they differ while a click is being followed into the listing).
+  function paintHipMarks() {
+    if (!hipBody) return;
+    const curLine = hipCur && hipCur.file === hipFile ? hipCur.line : -1;
+    const selLine = hipSel && hipSel.file === hipFile ? hipSel.line : -1;
+    for (const row of hipBody.querySelectorAll(".hipRow")) {
+      const ln = Number(row.dataset.line);
+      row.classList.toggle("cur", ln === curLine);
+      row.classList.toggle("sel", ln === selLine);
+    }
+  }
+
+  function scrollHipTo(lineNo) {
+    if (!hipBody || !hipLines) return;
+    const top = (lineNo - 1) * HIP_ROW_H;
+    const view = hipBody.clientHeight || 0;
+    if (top < hipBody.scrollTop || top > hipBody.scrollTop + view - HIP_ROW_H) {
+      hipBody.scrollTop = Math.max(0, top - view * 0.4);
+    }
+  }
+
+  function srcPosOfLine(idx) {
+    const ln = idx == null ? null : disasmLines[idx];
+    return ln && ln.file ? { file: ln.file, line: ln.line } : null;
+  }
+
+  function selectedSrcPos() {
+    if (!selected || selected.marker_id !== currentMarkerId) return null;
+    const idx = srcBody && srcBody._pcToLine ? srcBody._pcToLine.get(Number(selected.pc)) : null;
+    return srcPosOfLine(idx);
+  }
+
+  // Points the pane at a source position, switching files when it names another one. The
+  // position is remembered so a file arriving later, or a re-render, still marks the line.
+  function syncHipTo(pos) {
+    if (pos) hipCur = pos;
+    if (!hipOpen) return;
+    if (!pos) {
+      paintHipMarks();
+      return;
+    }
+    if (pos.file !== hipFile) {
+      showHipFile(pos.file);
+      // The text arrives asynchronously; onSourceText syncs again once it does.
+      if (!hipLines) return;
+    }
+    scrollHipTo(pos.line);
+    paintHipMarks();
+  }
+
+  function syncHipToSelected() {
+    syncHipTo(selectedSrcPos());
+  }
+
+  // Clicking a source line marks every instruction that line compiled to and takes the listing
+  // to the first of them, without moving the timeline selection.
+  function selectHipLine(lineNo) {
+    if (!Number.isFinite(lineNo)) return;
+    const same = hipSel && hipSel.file === hipFile && hipSel.line === lineNo;
+    hipSel = same ? null : { file: hipFile, line: lineNo };
+    hipSelVersion++;
+    paintHipMarks();
+    const idxs = hipSel ? srcLineIndex.get(`${hipFile}|${lineNo}`) : null;
+    if (idxs && idxs.length && srcBody && srcBody._disRowH) {
+      const top = Math.max(0, idxs[0] * srcBody._disRowH - srcBody.clientHeight * 0.35);
+      srcBody.scrollTop = top;
+    }
+    if (srcBody && srcBody._updateDis) srcBody._updateDis();
+    scheduleSaveUiState();
   }
 
   function setSourceMode(mode) {
@@ -1480,6 +1817,26 @@
     }
     disasmLines = nextLines;
     disasmAddrToEl = new Map();
+    buildSrcIndex();
+    if (hipSel && !srcFiles.some((f) => f.file === hipSel.file)) {
+      hipSel = null;
+      hipSelVersion++;
+    }
+    if (hipFile && !srcFiles.some((f) => f.file === hipFile)) hipFile = "";
+    // A position from the previous code object is stale unless this one still compiles something
+    // to it, so the mark cannot outlive the instruction it pointed at.
+    if (hipCur && !srcLineIndex.has(`${hipCur.file}|${hipCur.line}`)) hipCur = null;
+    if (hipOpen && !hasLineInfo()) hipOpen = false;
+    updateHipBtn();
+    if (hipOpen) {
+      ensureHipDom();
+      // Route through showHipFile even for the file already on show: after a webview reload the
+      // pane knows the path but holds none of its text, and showHipFile is what asks for it.
+      const want = hipFile || (srcFiles.length ? srcFiles[0].file : "");
+      if (want) showHipFile(want);
+      else renderHipBody();
+    }
+    applyHipLayout();
     hideDisMenu();
     if (!srcBody) return;
     // virtualized grid: only render visible rows to avoid huge DOM
@@ -1671,6 +2028,7 @@
     let lastRangeVer = -1;
     let lastSearchVer = -1;
     let lastSelKey = null;
+    let lastHipVer = -1;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -1705,9 +2063,11 @@
       // Wait links are attached to disBody and scroll naturally with rows.
       if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion
         && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion
-        && lastSearchVer === disSearchVersion && lastSelKey === selKey) return;
+        && lastSearchVer === disSearchVersion && lastSelKey === selKey
+        && lastHipVer === hipSelVersion) return;
       lastFirst = first; lastCount = count;
       lastSelKey = selKey;
+      lastHipVer = hipSelVersion;
       lastRegVer = regSelVersion;
       lastWaitVer = waitSelVersion;
       lastRangeVer = disRangeVersion;
@@ -1736,6 +2096,7 @@
 
         row.classList.toggle("selected", selected && selected.marker_id === currentMarkerId && selected.pc === pc);
         row.classList.toggle("rangeSel", !!range && idx >= range.lo && idx <= range.hi);
+        row.classList.toggle("lineSel", !!hipSel && ln.file === hipSel.file && ln.line === hipSel.line);
         const searchHits = searchM && disSearchSet.has(idx) ? disSearchHits(searchM, idx) : null;
         row.classList.toggle("searchHit", !!searchHits);
         row.classList.toggle("searchCur", !!searchHits && idx === searchCurLine);
@@ -1817,7 +2178,12 @@
               return;
             }
             const pcNow = Number(row.dataset.addr);
-            setDisRange(Number(row.dataset.line));
+            const lineNow = Number(row.dataset.line);
+            setDisRange(lineNow);
+            // Follow the row into the source pane whether or not the trace sampled it: most of
+            // the listing belongs to code this dispatch never entered, and reading where an
+            // instruction came from should not require it to have run.
+            syncHipTo(srcPosOfLine(lineNow));
             const hitNow = pcIndex.get(`${currentMarkerId}|${pcNow}`);
             if (!hitNow) return;
             panToIssue(hitNow.first);
@@ -1872,6 +2238,7 @@
     }
     // update row selection state for currently rendered rows
     if (srcBody && srcBody._updateDis) srcBody._updateDis();
+    syncHipToSelected();
   }
 
   function panToIssue(issue) {
@@ -2027,6 +2394,10 @@
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
     } else if (msg.type === "disasmError") {
       if (srcMeta) srcMeta.textContent = `Source: failed (${msg.error || "error"})`;
+    } else if (msg.type === "source") {
+      onSourceText(msg.path, msg.text);
+    } else if (msg.type === "sourceError") {
+      onSourceError(msg.path, msg.error);
     }
   });
 
@@ -2048,6 +2419,16 @@
     if (findInput) findInput.value = disSearch.query;
   }
   updateFindUI();
+  // Restore the HIP pane. Whether it can open at all depends on the line table, which only
+  // arrives with the disassembly, so renderDisasm is what finally shows or drops it.
+  if (SAVED_UI_STATE && SAVED_UI_STATE.hip) {
+    const _h = SAVED_UI_STATE.hip;
+    hipOpen = !!_h.open;
+    if (typeof _h.file === "string") hipFile = _h.file;
+    if (Number.isFinite(_h.w)) hipW = Math.max(220, _h.w);
+    if (_h.sel && typeof _h.sel.file === "string" && Number.isFinite(_h.sel.line)) hipSel = _h.sel;
+  }
+  updateHipBtn();
   // Restore current code object and selection if present
   if (SAVED_UI_STATE && SAVED_UI_STATE.currentMarkerId != null) {
     requestDisasm(SAVED_UI_STATE.currentMarkerId);

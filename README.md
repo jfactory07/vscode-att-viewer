@@ -10,6 +10,7 @@ Interactive timeline viewer for ROCm Advanced Thread Trace (ATT) inside VS Code,
 - Disassembly pane with:
   - Clickable register tokens (highlight matching/overlapping registers in nearby lines)
   - `s_waitcnt` dependency hints (polyline arrow to the corresponding memory op)
+  - Side-by-side HIP source, when the code object carries DWARF line tables
 - Occurrences pane:
   - Lane filter dropdown
   - Δt0 column (delta vs previous occurrence)
@@ -91,6 +92,8 @@ Disassembly:
 - Ctrl/Cmd + C (or the `Copy` button) copies the selected lines as `addr  instruction`
 - Right-click the listing for other copy formats (instruction text only, or TSV with per-slot counts)
 - Dragging inside a single line still makes a normal text selection, so partial copies work too
+- `HIP` opens the source pane; click an instruction to reach its source line, click a source line
+  to mark every instruction it compiled to (see [HIP source next to the listing](#hip-source-next-to-the-listing))
 
 ## Searching the disassembly
 
@@ -136,6 +139,35 @@ top sub-row is reused as soon as it frees up. A slot whose windows never overlap
 original single-row height; a slot that needs sub-rows splits the same height between them
 rather than making the timeline taller. Hovering or clicking picks the instruction on the
 sub-row under the pointer, and the tooltip names it as `sub-row=2/3`.
+
+## HIP source next to the listing
+
+The `HIP` button in the panel header opens the source the instructions were compiled from, to the
+right of the listing. Both directions are linked:
+
+- Clicking an instruction (in the listing or on the timeline) scrolls the pane to the HIP line it
+  came from and marks that line. This works for instructions the traced dispatch never ran too,
+  which is most of the listing: reading where an instruction came from does not require a sample
+- Clicking a HIP line tints **every** instruction it compiled to and takes the listing to the
+  first of them, without disturbing the timeline selection. This is what shows how one line
+  becomes a run of instructions: `store_to_lds(...)` on one line of a kernel header is the four
+  `ds_store_b128` whose execution windows overlap on the timeline
+- Line numbers of lines that produced instructions are marked, and their tooltip says how many;
+  lines that compiled to nothing (inlined away, or not part of this template instantiation) stay
+  dim and inert
+- The dropdown lists every file the code object was compiled from with its instruction count, so
+  inlined headers are reachable too. Following an instruction into another file switches the pane
+  to it
+- Drag the divider to resize the pane; the pane, the file and the selected line are restored when
+  the webview reloads
+
+The positions come from the code object's DWARF line table, so the button is only enabled when
+the traced code object carries one. Build with `-gline-tables-only` and profile again to get it —
+in hipconv that is `-DHIPCONV_LINE_TABLES=ON`, the default. Line tables carry no variable or type
+information and **do not change codegen**: compiling `depthwise_solo_shard0` with and without the
+flag gives a byte-identical instruction stream, so the timing you are reading is the timing of
+the code you would ship. The source files themselves are read from the paths recorded at compile
+time; a code object built on another machine reports the file it cannot find in the pane.
 
 ## Troubleshooting
 
