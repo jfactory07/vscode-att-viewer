@@ -4,14 +4,21 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Keep the wait-dependency link off the addresses it points between. The elbow was folded at
+  x=10 and run out to x=66, both inside the addr column, so the vertical segment sat on the
+  leading digits of every address it passed and the two horizontal segments covered the
+  addresses of the wait and its target outright — the two you look up when reading the link.
+  The addr column now reserves a 16 px channel on its left, indented past by the addresses and
+  widened into rather than taken out of the column, so the addresses keep exactly the width they
+  had. The link is drawn inside the channel and its arrow stops 3 px short of the text
 - Show the HIP source the instructions came from, in a pane to the right of the listing, opened
   with the `HIP` button. Clicking an instruction scrolls the pane to its source line, whether or
   not the traced dispatch ran it; clicking a source line tints every instruction that line
   compiled to and takes the listing to the first of them. That is how a single line of a kernel
   header shows up as the four `ds_store_b128` whose execution windows overlap on the timeline —
   on the trace at hand, the staging write at `kernel.h:539` compiles to 32 `ds_store_b128` over
-  the code object, four of them the ones on the timeline. Line numbers that produced instructions are marked
-  with the count in their tooltip, and lines that compiled to nothing stay dim and inert. The
+  the code object, four of them the ones on the timeline. Line numbers that produced instructions
+  are marked with the count in their tooltip, and lines that compiled to nothing stay dim. The
   dropdown lists every file the code object was compiled from with its instruction count, so
   inlined headers are reachable, and following an instruction into another file switches the pane
   over to it. Positions come from the code object's DWARF line table (`llvm-objdump

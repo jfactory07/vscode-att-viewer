@@ -1845,11 +1845,18 @@
     const disContainer = document.createElement("div");
     disContainer.className = "disContainer";
 
+    // A channel down the left of the addr column, indented past by the addresses themselves, so
+    // a wait link can be drawn between two rows without covering the addresses it points at.
+    // The addr column is widened by it rather than sharing its width with the link.
+    const ROW_PAD = 6; // .disRow padding-left
+    const LINK_CH = 16;
+    const ADDR_W = 74 + LINK_CH;
+    disContainer.style.setProperty("--addrChannel", `${LINK_CH}px`);
+
     // grid columns: addr | text | total | wave columns
-    const cols = ["74px", "1fr", "52px"];
+    const cols = [`${ADDR_W}px`, "1fr", "52px"];
     for (let w = 0; w < lanes; w++) cols.push("38px");
     const gridTemplateColumns = cols.join(" ");
-    const ADDR_W = 74;
 
     const header = document.createElement("div");
     header.className = "disHeader disRow";
@@ -1955,9 +1962,10 @@
 
       // Coordinates are in disBody content space.
       const yFrom = (waitSel.fromLine * ROW_H) + ROW_H * 0.5;
-      // Match the screenshot: elbow in the left gutter, arrow points into the target row.
-      const xEdge = Math.max(10, Math.min(ADDR_W - 8, 66)); // near end of addr column
-      const xGutter = 10; // left gutter fold
+      // The elbow stays inside the channel the addr column reserves for it: the arrow stops just
+      // short of where the addresses start, so a link never sits on top of the two it connects.
+      const xEdge = ROW_PAD + LINK_CH - 7;
+      const xGutter = ROW_PAD + 1;
 
       for (const t of waitSel.targets) {
         const yTo = (t.line * ROW_H) + ROW_H * 0.5;

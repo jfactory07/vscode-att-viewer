@@ -143,7 +143,8 @@ html, body {
 }
 /* while dragging a row range, suppress native text selection */
 .disContainer.dragging .disCell { user-select: none; }
-.disAddrCell { color: rgba(255,255,255,0.55); }
+/* indented past the channel the wait link is drawn in (--addrChannel, set from viewer.js) */
+.disAddrCell { color: rgba(255,255,255,0.55); padding-left: var(--addrChannel, 0px); }
 .disTextCell { color: rgba(255,255,255,0.92); }
 .disNumCell { text-align: right; color: rgba(255,255,255,0.78); }
 .regTok {
