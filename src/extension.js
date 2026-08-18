@@ -35,6 +35,40 @@ function pickResultsDb(attPath) {
   return null;
 }
 
+// rocprofv3 copies every source file it can read at capture time into the dispatch's UI output
+// directory, as `source_<n>_<basename>`. That copy is the text the code object was compiled from.
+// The working tree drifts away from it with the next edit -- on the traces here, a kernel header
+// captured at 1112 lines is 1166 in the tree, so every attribution below the first insertion
+// points at the wrong statement -- and a `-gline-tables-only` line table carries no file checksum
+// to catch it. So the panel reads the capture-time copy and never the working tree.
+function findSourceSnapshotDir(attPath) {
+  const dir = path.dirname(attPath);
+  // e.g. zrow_16742_shader_engine_0_338.att -> ui_output_agent_16742_dispatch_338
+  const m = path.basename(attPath).match(/_(\d+)_shader_engine_\d+_(\d+)\.att$/);
+  if (!m) return null;
+  const [, agent, dispatch] = m;
+  const exact = path.join(dir, `ui_output_agent_${agent}_dispatch_${dispatch}`);
+  if (fileExists(exact)) return exact;
+  // The agent number in the trace name and in the UI output directory have agreed on every
+  // capture seen so far; fall back to the dispatch alone in case they ever do not.
+  const rx = new RegExp(`^ui_output_agent_\\d+_dispatch_${dispatch}$`);
+  const cands = listFiles(dir).filter((p) => rx.test(path.basename(p)));
+  return cands.length === 1 ? cands[0] : null;
+}
+
+function indexSourceSnapshot(dir) {
+  const byBase = new Map();
+  if (!dir) return byBase;
+  for (const p of listFiles(dir)) {
+    const m = path.basename(p).match(/^source_\d+_(.+)$/);
+    if (!m) continue;
+    const arr = byBase.get(m[1]);
+    if (arr) arr.push(p);
+    else byBase.set(m[1], [p]);
+  }
+  return byBase;
+}
+
 async function promptForFile(cfg, settingKey, notFoundMsg, openLabel) {
   const choice = await vscode.window.showErrorMessage(notFoundMsg, "Browse…", "Cancel");
   if (choice !== "Browse…") return null;
@@ -340,6 +374,11 @@ async function openAttImpl(context, attUri, existingPanel = null) {
 
   // In-panel disassembly cache
   const disasmCache = new Map();
+  // The dispatch's capture-time source copies, keyed by file name. `dir` is reported to the webview
+  // so the HIP pane can say why it has nothing to show when a capture saved no sources.
+  const snapshotDir = findSourceSnapshotDir(attPath);
+  const snapshotByBase = indexSourceSnapshot(snapshotDir);
+  const sourceSnapshot = { dir: snapshotDir || "", files: snapshotByBase.size };
   // Source paths named by the line tables we have parsed. The webview asks the host to read
   // HIP files by path, so answer only for files a code object actually points at.
   const knownSourceFiles = new Set();
@@ -388,6 +427,7 @@ async function openAttImpl(context, attUri, existingPanel = null) {
           markerId: msg.markerId,
           codeobjPath,
           lines: disasmCache.get(codeobjPath),
+          sourceSnapshot,
         });
         return;
       }
@@ -400,6 +440,7 @@ async function openAttImpl(context, attUri, existingPanel = null) {
           markerId: msg.markerId,
           codeobjPath,
           lines,
+          sourceSnapshot,
         });
       } catch (e) {
         panel.webview.postMessage({
@@ -417,10 +458,27 @@ async function openAttImpl(context, attUri, existingPanel = null) {
         fail("not referenced by this code object");
         return;
       }
+      const base = path.basename(srcPath);
+      if (!snapshotDir) {
+        fail("this trace has no captured sources next to it (no ui_output_… directory)");
+        return;
+      }
+      // The copies carry a file name and no directory, so a capture that saved two same-named
+      // files from different directories cannot be told apart. Say so rather than guess.
+      const cands = snapshotByBase.get(base) || [];
+      if (cands.length !== 1) {
+        fail(
+          cands.length === 0
+            ? `not captured at profile time (no source_*_${base} in ${path.basename(snapshotDir)})`
+            : `${cands.length} captured copies are named ${base}, so this path is ambiguous`
+        );
+        return;
+      }
+      const snapPath = cands[0];
       try {
-        const st = fs.statSync(srcPath);
+        const st = fs.statSync(snapPath);
         if (!st.isFile()) {
-          fail("not a file");
+          fail("the captured copy is not a file");
           return;
         }
         if (st.size > SOURCE_MAX_BYTES) {
@@ -430,10 +488,10 @@ async function openAttImpl(context, attUri, existingPanel = null) {
         panel.webview.postMessage({
           type: "source",
           path: srcPath,
-          text: fs.readFileSync(srcPath, "utf8"),
+          snapshotPath: snapPath,
+          text: fs.readFileSync(snapPath, "utf8"),
         });
       } catch (e) {
-        // The usual case is a code object built on another machine, or a moved checkout.
         fail(String(e && e.message ? e.message : e));
       }
     }
@@ -546,5 +604,5 @@ function deactivate() {}
 
 // runObjdump is exported so the listing parser can be tested against a real code object
 // without a VS Code host.
-module.exports = { activate, deactivate, runObjdump };
+module.exports = { activate, deactivate, runObjdump, findSourceSnapshotDir, indexSourceSnapshot };
 

@@ -10,7 +10,7 @@ Interactive timeline viewer for ROCm Advanced Thread Trace (ATT) inside VS Code,
 - Disassembly pane with:
   - Clickable register tokens (highlight matching/overlapping registers in nearby lines)
   - `s_waitcnt` dependency hints (polyline arrow to the corresponding memory op)
-  - Side-by-side HIP source, when the code object carries DWARF line tables
+  - Side-by-side HIP source, as the capture saved it, when the code object carries DWARF line tables
 - Occurrences pane:
   - Lane filter dropdown
   - Δt0 column (delta vs previous occurrence)
@@ -161,13 +161,27 @@ right of the listing. Both directions are linked:
 - Drag the divider to resize the pane; the pane, the file and the selected line are restored when
   the webview reloads
 
-The positions come from the code object's DWARF line table, so the button is only enabled when
-the traced code object carries one. Build with `-gline-tables-only` and profile again to get it —
-in hipconv that is `-DHIPCONV_LINE_TABLES=ON`, the default. Line tables carry no variable or type
-information and **do not change codegen**: compiling `depthwise_solo_shard0` with and without the
-flag gives a byte-identical instruction stream, so the timing you are reading is the timing of
-the code you would ship. The source files themselves are read from the paths recorded at compile
-time; a code object built on another machine reports the file it cannot find in the pane.
+The positions come from the code object's DWARF line table, so the button needs the traced code
+object to carry one. Build with `-gline-tables-only` and profile again to get it — in hipconv that
+is `-DHIPCONV_LINE_TABLES=ON`, the default. Line tables carry no variable or type information and
+**do not change codegen**: compiling `depthwise_solo_shard0` with and without the flag gives a
+byte-identical instruction stream, so the timing you are reading is the timing of the code you
+would ship.
+
+### The text is the one the capture saved, not the working tree
+
+rocprofv3 copies every source file it can read at capture time into the dispatch's UI output
+directory, as `ui_output_agent_<agent>_dispatch_<n>/source_<i>_<name>`, and the pane reads only
+those copies. That is deliberate: the line numbers belong to the build that ran, and an edit to the
+file shifts everything below it. On one capture here a kernel header saved at 1113 lines is 1194 in
+the tree, with the first insertion at line 219 — read against the tree, every instruction below it
+would point at the wrong statement, and `-gline-tables-only` records no file checksum that would
+let the panel notice. The header labels the text `snapshot` and its tooltip names the copy it read.
+
+So the `HIP` button also needs the capture to have saved sources; its tooltip says which half is
+missing. A capture taken before line tables were enabled has a UI output directory with no
+`source_*` files in it, and a file the capture could not read at all (a generated header since
+deleted, say) is reported as not captured, in the pane, with the pane left open.
 
 ## Troubleshooting
 

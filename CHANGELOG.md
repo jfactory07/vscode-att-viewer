@@ -4,6 +4,22 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Read the HIP source from the copies rocprof saved with the trace, never from the working tree.
+  rocprofv3 writes every source file it could read at capture time into the dispatch's UI output
+  directory as `source_<i>_<name>`, and that copy is the text the code object's line numbers refer
+  to; the tree drifts away from it with the next edit. It already had: a kernel header captured at
+  1113 lines is 1194 in the tree, first insertion at line 219, so every instruction attributed
+  below that pointed at the wrong statement — and a `-gline-tables-only` line table carries no file
+  checksum, so nothing could notice. The host resolves the directory from the trace name
+  (`zrow_16742_shader_engine_0_338.att` → `ui_output_agent_16742_dispatch_338`) and serves the copy
+  whose file name the DWARF path ends in, refusing rather than guessing when a capture saved two
+  files under one name. The pane labels the text `snapshot` and names the copy in the tooltip. The
+  `HIP` button now needs both halves — a line table and a capture that saved sources — and its
+  tooltip says which one is missing, so a trace taken before line tables were enabled explains
+  itself instead of silently showing today's text. The file dropdown's tooltip used to name the
+  compile-time path alone, which is also where the working tree keeps the file and so read as a
+  claim about which copy was on screen; it now names the path the code object was built from and
+  the captured copy the text came from, by exact file once the host has read it
 - Name the code object by file name in the disasm header instead of spelling out its path. The
   capture directory is the same for every marker in a trace and long enough to crowd out the find
   bar, and it is not what you read the header for. The full path is on the header's tooltip and on

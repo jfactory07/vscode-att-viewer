@@ -472,6 +472,8 @@
   let hipSelVersion = 0;
   let hipCur = null; // { file, line } the pane is pointed at, from the last instruction followed
   const hipTextCache = new Map(); // path -> string[]
+  const hipSnapOf = new Map(); // compile-time path -> the capture-time copy it was read from
+  let srcSnapshot = null; // { dir, files } the host found next to the trace
   let srcLineIndex = new Map(); // "file|line" -> ascending disasm row indices
   let srcFiles = []; // [{ file, count }], most instructions first
   const HIP_ROW_H = 18;
@@ -920,6 +922,16 @@
     return srcFiles.length > 0;
   }
 
+  // The pane only ever shows the copies rocprof saved with the trace, so it needs both a line
+  // table to place the instructions and a capture that actually saved the sources.
+  function hasSourceSnapshot() {
+    return !!(srcSnapshot && srcSnapshot.files > 0);
+  }
+
+  function hipAvailable() {
+    return hasLineInfo() && hasSourceSnapshot();
+  }
+
   function baseName(p) {
     const s = String(p || "");
     const i = s.lastIndexOf("/");
@@ -996,20 +1008,24 @@
 
   function updateHipBtn() {
     if (!hipBtn) return;
-    const on = hasLineInfo();
+    const on = hipAvailable();
     hipBtn.disabled = !on;
     hipBtn.classList.toggle("active", hipOpen && on);
     hipBtn.title = on
-      ? "Show the HIP source next to the listing.\n" +
+      ? "Show the HIP source next to the listing, as rocprof captured it with the trace.\n" +
         "Click an instruction to reach its source line; click a source line to mark every " +
         "instruction it compiled to."
-      : "This code object carries no DWARF line table, so no instruction can be traced back to " +
-        "HIP. Rebuild with -gline-tables-only (in hipconv: -DHIPCONV_LINE_TABLES=ON) and profile " +
-        "again.";
+      : !hasLineInfo()
+        ? "This code object carries no DWARF line table, so no instruction can be traced back to " +
+          "HIP. Rebuild with -gline-tables-only (in hipconv: -DHIPCONV_LINE_TABLES=ON) and " +
+          "profile again."
+        : "This capture saved no HIP sources next to the trace, and the pane will not read the " +
+          "working tree instead: its line numbers are the ones the code object was built with, " +
+          "and an edited file silently shifts them.";
   }
 
   function setHipOpen(open) {
-    if (open && !hasLineInfo()) return;
+    if (open && !hipAvailable()) return;
     hipOpen = !!open;
     if (hipOpen) {
       ensureHipDom();
@@ -1030,11 +1046,24 @@
       const opt = document.createElement("option");
       opt.value = f.file;
       opt.textContent = `${baseName(f.file)}  (${f.count})`;
-      opt.title = f.file;
+      opt.title = hipFileHint(f.file);
       hipFileSel.appendChild(opt);
     }
     hipFileSel.value = hipFile;
-    hipFileSel.title = hipFile || "Source files this code object was compiled from";
+    hipFileSel.title = hipFile ? hipFileHint(hipFile) : "Source files this code object was compiled from";
+  }
+
+  // The path in the line table is where the file was compiled from, which is also where the
+  // working tree keeps it -- so naming it on its own reads as though the pane were showing that
+  // file. Say which one is on screen.
+  function hipFileHint(file) {
+    const snap = hipSnapOf.get(file);
+    const where = snap
+      ? snap
+      : srcSnapshot && srcSnapshot.dir
+        ? `${srcSnapshot.dir}/source_*_${baseName(file)}`
+        : "the copy captured with the trace";
+    return `${file}\nthe path the code object was compiled from.\nOn screen is the copy captured with the trace:\n${where}`;
   }
 
   function showHipFile(pathStr) {
@@ -1054,9 +1083,14 @@
     vscode.postMessage({ type: "requestSource", path: p });
   }
 
-  function onSourceText(pathStr, text) {
+  function onSourceText(pathStr, text, snapshotPath) {
     const lines = String(text == null ? "" : text).split(/\r?\n/);
     hipTextCache.set(pathStr, lines);
+    // The dropdown was built before the host said which copy it read, so let it say so now.
+    if (snapshotPath && hipSnapOf.get(pathStr) !== snapshotPath) {
+      hipSnapOf.set(pathStr, snapshotPath);
+      renderHipFileSel();
+    }
     if (pathStr !== hipFile) return;
     hipLines = lines;
     hipError = "";
@@ -1118,7 +1152,14 @@
     }
     hipBody.appendChild(frag);
     const n = srcFiles.find((f) => f.file === hipFile);
-    if (hipMetaEl) hipMetaEl.textContent = n ? `${n.count} instr` : "";
+    if (hipMetaEl) {
+      hipMetaEl.textContent = `${n ? `${n.count} instr · ` : ""}snapshot`;
+      const snap = hipSnapOf.get(hipFile);
+      hipMetaEl.title =
+        `The text is the copy rocprof saved with the trace${snap ? `:\n${snap}` : ""}\n` +
+        "not the file in the working tree, which the line numbers would no longer fit once it " +
+        "is edited.";
+    }
     paintHipMarks();
   }
 
@@ -1855,7 +1896,7 @@
     // A position from the previous code object is stale unless this one still compiles something
     // to it, so the mark cannot outlive the instruction it pointed at.
     if (hipCur && !srcLineIndex.has(`${hipCur.file}|${hipCur.line}`)) hipCur = null;
-    if (hipOpen && !hasLineInfo()) hipOpen = false;
+    if (hipOpen && !hipAvailable()) hipOpen = false;
     updateHipBtn();
     if (hipOpen) {
       ensureHipDom();
@@ -2426,6 +2467,8 @@
     const msg = event.data;
     if (!msg || !msg.type) return;
     if (msg.type === "disasm" && msg.lines) {
+      // Before rendering: the pane's availability is decided while the new listing is indexed.
+      if (msg.sourceSnapshot !== undefined) srcSnapshot = msg.sourceSnapshot;
       renderDisasm(msg.lines);
       updateWaitSelFromSelected();
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
@@ -2433,7 +2476,7 @@
       const p = msg.codeobjPath || currentCodeobjPath;
       setSrcMeta(`Source: ${baseName(p) || "?"} failed (${msg.error || "error"})`, p);
     } else if (msg.type === "source") {
-      onSourceText(msg.path, msg.text);
+      onSourceText(msg.path, msg.text, msg.snapshotPath);
     } else if (msg.type === "sourceError") {
       onSourceError(msg.path, msg.error);
     }
@@ -2457,8 +2500,9 @@
     if (findInput) findInput.value = disSearch.query;
   }
   updateFindUI();
-  // Restore the HIP pane. Whether it can open at all depends on the line table, which only
-  // arrives with the disassembly, so renderDisasm is what finally shows or drops it.
+  // Restore the HIP pane. Whether it can open at all depends on the line table and on the
+  // captured sources, both of which arrive with the disassembly, so renderDisasm is what finally
+  // shows or drops it.
   if (SAVED_UI_STATE && SAVED_UI_STATE.hip) {
     const _h = SAVED_UI_STATE.hip;
     hipOpen = !!_h.open;
