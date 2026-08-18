@@ -800,6 +800,8 @@
 
   const sourceHeader = srcMeta ? srcMeta.parentElement : null;
   const sourcePane = sourceHeader ? sourceHeader.parentElement : null;
+  let pathBtn = null;
+  let currentCodeobjPath = "";
   let hipBtn = null;
   let hipPane = null;
   let hipDivider = null;
@@ -818,6 +820,19 @@
   let findReBtn = null;
   let findAllBtn = null;
   if (sourceHeader) {
+    // The header names the code object by file name only -- the directory is long, always the
+    // same within a capture, and pushes the tabs around -- so keep the full path one click away.
+    pathBtn = document.createElement("button");
+    pathBtn.className = "tabBtn";
+    pathBtn.id = "srcPathBtn";
+    pathBtn.textContent = "copy path";
+    pathBtn.addEventListener("click", async () => {
+      if (!currentCodeobjPath) return;
+      await writeClipboard(currentCodeobjPath);
+      showToast(`Copied ${currentCodeobjPath}`);
+    });
+    sourceHeader.appendChild(pathBtn);
+
     const tabs = document.createElement("div");
     tabs.className = "srcTabs";
 
@@ -1793,14 +1808,28 @@
     if (findNextBtn) findNextBtn.disabled = none;
   }
 
+  function setSrcMeta(text, fullPath) {
+    currentCodeobjPath = fullPath || "";
+    if (srcMeta) {
+      srcMeta.textContent = text;
+      srcMeta.title = currentCodeobjPath;
+    }
+    if (pathBtn) {
+      pathBtn.disabled = !currentCodeobjPath;
+      pathBtn.title = currentCodeobjPath
+        ? `Copy the code object's full path:\n${currentCodeobjPath}`
+        : "No code object path for this marker";
+    }
+  }
+
   function requestDisasm(markerId) {
     const p = codeobjFiles[String(markerId)];
     if (!p) {
-      if (srcMeta) srcMeta.textContent = `Source: marker=${markerId} (no code object path)`;
+      setSrcMeta(`Source: marker=${markerId} (no code object path)`, "");
       return;
     }
     currentMarkerId = markerId;
-    if (srcMeta) srcMeta.textContent = `Source: marker=${markerId}  ${p}`;
+    setSrcMeta(`Source: marker=${markerId}  ${baseName(p)}`, p);
     vscode.postMessage({ type: "requestDisasm", markerId, codeobjPath: p, gpuArch: (DATA.meta && DATA.meta.gpu_arch) || "gfx950" });
   }
 
@@ -2401,7 +2430,8 @@
       updateWaitSelFromSelected();
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
     } else if (msg.type === "disasmError") {
-      if (srcMeta) srcMeta.textContent = `Source: failed (${msg.error || "error"})`;
+      const p = msg.codeobjPath || currentCodeobjPath;
+      setSrcMeta(`Source: ${baseName(p) || "?"} failed (${msg.error || "error"})`, p);
     } else if (msg.type === "source") {
       onSourceText(msg.path, msg.text);
     } else if (msg.type === "sourceError") {

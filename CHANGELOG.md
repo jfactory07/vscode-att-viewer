@@ -4,6 +4,11 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Name the code object by file name in the disasm header instead of spelling out its path. The
+  capture directory is the same for every marker in a trace and long enough to crowd out the find
+  bar, and it is not what you read the header for. The full path is on the header's tooltip and on
+  the new `copy path` button next to the name, which puts it on the clipboard when you need it for
+  a shell — `llvm-objdump`, `readelf` — outside the viewer
 - Keep the wait-dependency link off the addresses it points between. The elbow was folded at
   x=10 and run out to x=66, both inside the addr column, so the vertical segment sat on the
   leading digits of every address it passed and the two horizontal segments covered the
