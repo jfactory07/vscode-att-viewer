@@ -374,6 +374,8 @@ async function openAttImpl(context, attUri, existingPanel = null) {
 
   // In-panel disassembly cache
   const disasmCache = new Map();
+  const inlineStackCache = new Map(); // `${codeobj}|${addr}` -> stack[]
+  const llvmSymbolizerPath = llvmObjdumpPath.replace(/objdump([^/\\]*)$/, "symbolizer$1");
   // The dispatch's capture-time source copies, keyed by file name. `dir` is reported to the webview
   // so the HIP pane can say why it has nothing to show when a capture saved no sources.
   const snapshotDir = findSourceSnapshotDir(attPath);
@@ -384,6 +386,9 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   const knownSourceFiles = new Set();
   const rememberSourceFiles = (lines) => {
     for (const ln of lines) if (ln.file) knownSourceFiles.add(ln.file);
+  };
+  const rememberStackFiles = (stack) => {
+    for (const fr of stack) if (fr.file) knownSourceFiles.add(fr.file);
   };
 
   // Persisted color config (global across traces)
@@ -450,6 +455,49 @@ async function openAttImpl(context, attUri, existingPanel = null) {
           error: String(e && e.message ? e.message : e),
         });
       }
+    } else if (msg.type === "requestInlineStack") {
+      const codeobjPath = msg.codeobjPath;
+      const addr = Number(msg.addr);
+      const reqId = msg.reqId;
+      const markerId = msg.markerId;
+      const fail = (error) =>
+        panel.webview.postMessage({
+          type: "inlineStack",
+          reqId,
+          markerId,
+          addr,
+          stack: [],
+          error,
+        });
+      if (!codeobjPath || !Number.isFinite(addr)) {
+        fail("missing code object or address");
+        return;
+      }
+      const cacheKey = `${codeobjPath}|${addr}`;
+      if (inlineStackCache.has(cacheKey)) {
+        panel.webview.postMessage({
+          type: "inlineStack",
+          reqId,
+          markerId,
+          addr,
+          stack: inlineStackCache.get(cacheKey),
+        });
+        return;
+      }
+      try {
+        const stack = await runSymbolizerInlineStack(llvmSymbolizerPath, codeobjPath, addr);
+        inlineStackCache.set(cacheKey, stack);
+        rememberStackFiles(stack);
+        panel.webview.postMessage({
+          type: "inlineStack",
+          reqId,
+          markerId,
+          addr,
+          stack,
+        });
+      } catch (e) {
+        fail(String(e && e.message ? e.message : e));
+      }
     } else if (msg.type === "requestSource") {
       const srcPath = String(msg.path || "");
       const fail = (error) =>
@@ -506,6 +554,39 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   if (initialMarkers && initialMarkers.length) {
     panel.webview.postMessage({ type: "markers", value: initialMarkers });
   }
+}
+
+function parseInlineStack(out) {
+  const lines = String(out || "").split(/\r?\n/).filter((l) => l.length > 0);
+  const stack = [];
+  for (let i = 0; i + 1 < lines.length; i += 2) {
+    const func = lines[i].trim();
+    const loc = lines[i + 1].trim();
+    const m = loc.match(/^(.+):(\d+)(?::(\d+))?$/);
+    if (!m || m[1] === "??") continue;
+    stack.push({ func, file: m[1], line: parseInt(m[2], 10) });
+  }
+  return stack;
+}
+
+function runSymbolizerInlineStack(symbolizer, codeobjPath, addr) {
+  return new Promise((resolve, reject) => {
+    const args = [`--obj=${codeobjPath}`, "--inlining"];
+    const p = spawn(symbolizer, args, { env: process.env });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("error", reject);
+    p.stdin.write(`0x${Number(addr).toString(16)}\n`);
+    p.stdin.end();
+    p.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(`llvm-symbolizer failed (${code}): ${err}`));
+      }
+      resolve(parseInlineStack(out));
+    });
+  });
 }
 
 function runObjdump(objdump, codeobjPath) {
@@ -604,5 +685,13 @@ function deactivate() {}
 
 // runObjdump is exported so the listing parser can be tested against a real code object
 // without a VS Code host.
-module.exports = { activate, deactivate, runObjdump, findSourceSnapshotDir, indexSourceSnapshot };
+module.exports = {
+  activate,
+  deactivate,
+  runObjdump,
+  runSymbolizerInlineStack,
+  parseInlineStack,
+  findSourceSnapshotDir,
+  indexSourceSnapshot,
+};
 

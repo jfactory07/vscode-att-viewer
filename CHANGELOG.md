@@ -4,6 +4,10 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- HIP source pane: show the selected instruction's full inline call stack (via `llvm-symbolizer
+  --inlining`) between the file picker and the source text; click a frame to jump to that file and
+  line. Frame `#0` is the innermost site (what `--line-numbers` showed before); higher numbers walk
+  outward through callers
 - Read the HIP source from the copies rocprof saved with the trace, never from the working tree.
   rocprofv3 writes every source file it could read at capture time into the dispatch's UI output
   directory as `source_<i>_<name>`, and that copy is the text the code object's line numbers refer

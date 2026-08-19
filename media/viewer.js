@@ -471,6 +471,10 @@
   let hipSel = null; // { file, line } picked in the pane; tints the instructions it compiled to
   let hipSelVersion = 0;
   let hipCur = null; // { file, line } the pane is pointed at, from the last instruction followed
+  let hipStack = null; // [{ func, file, line }] innermost first, from llvm-symbolizer --inlining
+  let hipStackFrame = 0; // which stack entry hipCur follows
+  let hipStackReq = 0;
+  let hipStackLoading = false;
   const hipTextCache = new Map(); // path -> string[]
   const hipSnapOf = new Map(); // compile-time path -> the capture-time copy it was read from
   let srcSnapshot = null; // { dir, files } the host found next to the trace
@@ -810,6 +814,7 @@
   let hipBody = null;
   let hipFileSel = null;
   let hipMetaEl = null;
+  let hipStackEl = null;
   let tabDisasmBtn = null;
   let tabOccBtn = null;
   let copyBtn = null;
@@ -963,6 +968,10 @@
     closeBtn.addEventListener("click", () => setHipOpen(false));
     head.appendChild(closeBtn);
 
+    hipStackEl = document.createElement("div");
+    hipStackEl.className = "hipStack";
+    hipStackEl.title = "Inline call stack for the selected instruction; click a frame to jump";
+
     hipBody = document.createElement("div");
     hipBody.className = "hipBody";
     hipBody.addEventListener("click", (ev) => {
@@ -973,6 +982,7 @@
     });
 
     hipPane.appendChild(head);
+    hipPane.appendChild(hipStackEl);
     hipPane.appendChild(hipBody);
     sourcePane.appendChild(hipDivider);
     sourcePane.appendChild(hipPane);
@@ -1033,6 +1043,7 @@
       if (!hipFile && srcFiles.length) showHipFile(srcFiles[0].file);
       else renderHipFileSel();
       syncHipToSelected();
+      if (selected && selected.marker_id === currentMarkerId) requestHipStack(selected.pc);
     }
     applyHipLayout();
     updateHipBtn();
@@ -1195,6 +1206,83 @@
     return ln && ln.file ? { file: ln.file, line: ln.line } : null;
   }
 
+  function clearHipStack() {
+    hipStack = null;
+    hipStackFrame = 0;
+    hipStackLoading = false;
+    renderHipStack();
+  }
+
+  function requestHipStack(pc) {
+    if (!hipOpen || !currentCodeobjPath) {
+      clearHipStack();
+      return;
+    }
+    const pcNum = Number(pc);
+    if (!Number.isFinite(pcNum)) {
+      clearHipStack();
+      return;
+    }
+    hipStackLoading = true;
+    hipStack = null;
+    renderHipStack();
+    const reqId = ++hipStackReq;
+    vscode.postMessage({
+      type: "requestInlineStack",
+      reqId,
+      markerId: currentMarkerId,
+      codeobjPath: currentCodeobjPath,
+      addr: pcNum,
+    });
+  }
+
+  function renderHipStack() {
+    if (!hipStackEl) return;
+    hipStackEl.innerHTML = "";
+    if (hipStackLoading) {
+      const note = document.createElement("div");
+      note.className = "hipStackNote";
+      note.textContent = "Resolving call stack…";
+      hipStackEl.appendChild(note);
+      hipStackEl.style.display = "";
+      return;
+    }
+    if (!hipStack || !hipStack.length) {
+      hipStackEl.style.display = "none";
+      return;
+    }
+    hipStackEl.style.display = "";
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < hipStack.length; i++) {
+      const fr = hipStack[i];
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "hipStackFrame";
+      row.classList.toggle("active", i === hipStackFrame);
+      const where = `${baseName(fr.file)}:${fr.line}`;
+      row.textContent = `#${i}  ${fr.func || "?"}  ${where}`;
+      row.title = `${fr.func || "?"}\n${fr.file}:${fr.line}`;
+      row.addEventListener("click", () => selectHipStackFrame(i));
+      frag.appendChild(row);
+    }
+    hipStackEl.appendChild(frag);
+  }
+
+  function selectHipStackFrame(i) {
+    if (!hipStack || i < 0 || i >= hipStack.length) return;
+    hipStackFrame = i;
+    renderHipStack();
+    syncHipTo({ file: hipStack[i].file, line: hipStack[i].line });
+  }
+
+  function selectedStackPos() {
+    if (hipStack && hipStack.length > hipStackFrame) {
+      const fr = hipStack[hipStackFrame];
+      if (fr && fr.file) return { file: fr.file, line: fr.line };
+    }
+    return selectedSrcPos();
+  }
+
   function selectedSrcPos() {
     if (!selected || selected.marker_id !== currentMarkerId) return null;
     const idx = srcBody && srcBody._pcToLine ? srcBody._pcToLine.get(Number(selected.pc)) : null;
@@ -1220,7 +1308,7 @@
   }
 
   function syncHipToSelected() {
-    syncHipTo(selectedSrcPos());
+    syncHipTo(selectedStackPos());
   }
 
   // Clicking a source line marks every instruction that line compiled to and takes the listing
@@ -1896,6 +1984,7 @@
     // A position from the previous code object is stale unless this one still compiles something
     // to it, so the mark cannot outlive the instruction it pointed at.
     if (hipCur && !srcLineIndex.has(`${hipCur.file}|${hipCur.line}`)) hipCur = null;
+    clearHipStack();
     if (hipOpen && !hipAvailable()) hipOpen = false;
     updateHipBtn();
     if (hipOpen) {
@@ -2263,7 +2352,10 @@
             // instruction came from should not require it to have run.
             syncHipTo(srcPosOfLine(lineNow));
             const hitNow = pcIndex.get(`${currentMarkerId}|${pcNow}`);
-            if (!hitNow) return;
+            if (!hitNow) {
+              requestHipStack(pcNow);
+              return;
+            }
             panToIssue(hitNow.first);
             const e0 = DATA.events[hitNow.idxs[0]];
             selected = { marker_id: currentMarkerId, pc: pcNow, lane: e0.lane, issue: e0.issue };
@@ -2316,6 +2408,7 @@
     }
     // update row selection state for currently rendered rows
     if (srcBody && srcBody._updateDis) srcBody._updateDis();
+    requestHipStack(pcNum);
     syncHipToSelected();
   }
 
@@ -2479,6 +2572,14 @@
       onSourceText(msg.path, msg.text, msg.snapshotPath);
     } else if (msg.type === "sourceError") {
       onSourceError(msg.path, msg.error);
+    } else if (msg.type === "inlineStack") {
+      if (msg.reqId !== hipStackReq) return;
+      if (msg.markerId !== currentMarkerId) return;
+      hipStackLoading = false;
+      hipStack = Array.isArray(msg.stack) && msg.stack.length ? msg.stack : null;
+      hipStackFrame = 0;
+      renderHipStack();
+      syncHipToSelected();
     }
   });
 

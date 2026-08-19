@@ -212,7 +212,7 @@ html, body {
   grid-column: 3;
   min-width: 0;
   display: grid;
-  grid-template-rows: 34px 1fr;
+  grid-template-rows: 34px auto 1fr;
   border-left: 1px solid rgba(255,255,255,0.08);
   background: #0f1012;
 }
@@ -238,6 +238,41 @@ html, body {
   padding: 2px 4px;
 }
 .hipMeta { flex: 0 0 auto; color: rgba(255,255,255,0.55); font-size: 11px; white-space: nowrap; }
+.hipStack {
+  display: none;
+  max-height: 132px;
+  overflow: auto;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  background: rgba(0,0,0,0.18);
+}
+.hipStackNote {
+  padding: 4px 8px;
+  color: rgba(255,255,255,0.45);
+  font-size: 11px;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.hipStackFrame {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 2px 8px;
+  cursor: pointer;
+  color: rgba(255,255,255,0.62);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hipStackFrame:hover { background: rgba(255,255,255,0.06); }
+.hipStackFrame.active {
+  background: rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.95);
+  box-shadow: inset 3px 0 0 rgba(255,255,255,0.45);
+}
 .hipBody {
   overflow: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
