@@ -20,6 +20,7 @@
   const divider = document.getElementById("divider");
   const srcMeta = document.getElementById("srcMeta");
   const srcBody = document.getElementById("srcBody");
+  const disTip = document.getElementById("disTip");
   const ctx = canvas.getContext("2d");
 
   // webview state persistence (fallback when VS Code reloads the webview)
@@ -475,14 +476,21 @@
   let hipStackFrame = 0; // which stack entry hipCur follows
   let hipStackReq = 0;
   let hipStackLoading = false;
+  let hipStackError = "";
   const hipTextCache = new Map(); // path -> string[]
   const hipSnapOf = new Map(); // compile-time path -> the capture-time copy it was read from
-  let srcSnapshot = null; // { dir, files } the host found next to the trace
+  let srcSnapshot = null; // { dir, files, captured[] } the host found next to the trace
+  let hipSourceFallback = false; // read compile-time path when rocprof saved no snapshot
+  let capturedBasenames = new Set(); // basenames rocprof copied into ui_output_*
   let srcLineIndex = new Map(); // "file|line" -> ascending disasm row indices
   let srcFiles = []; // [{ file, count }], most instructions first
   const HIP_ROW_H = 18;
   let disSearchSet = null; // Set of matching line indices, for O(1) lookup while rendering
   let disSearchVersion = 0;
+  // Official AMD machine-readable ISA index for the traced code object's gfx target.
+  let currentGpuArch = "";
+  let currentIsaKey = "";
+  let currentIsaIndex = null;
 
   function escapeHtml(s) {
     return String(s)
@@ -491,6 +499,123 @@
       .replaceAll(">", "&gt;")
       .replaceAll("\"", "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  const CPP_KW = new Set([
+    "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "break", "case",
+    "catch", "class", "compl", "concept", "const", "consteval", "constexpr", "constinit",
+    "const_cast", "continue", "co_await", "co_return", "co_yield", "decltype", "default",
+    "delete", "do", "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false",
+    "final", "for", "friend", "goto", "if", "inline", "mutable", "namespace", "new", "noexcept",
+    "not", "not_eq", "nullptr", "operator", "or", "or_eq", "override", "private", "protected",
+    "public", "register", "reinterpret_cast", "requires", "return", "sizeof", "static",
+    "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local",
+    "throw", "true", "try", "typedef", "typeid", "typename", "union", "using", "virtual",
+    "volatile", "while", "xor", "xor_eq",
+  ]);
+  const CPP_TYPE = new Set([
+    "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short",
+    "signed", "size_t", "ssize_t", "std", "string", "string_view", "uint8_t", "uint16_t",
+    "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t", "unsigned", "void",
+    "wchar_t", "half", "float16_t", "bfloat16_t",
+  ]);
+  const HIP_ATTR = new Set([
+    "__attribute__", "__constant__", "__device__", "__forceinline__", "__global__", "__half",
+    "__host__", "__launch_bounds__", "__noinline__", "__shared__", "__restrict__", "__align__",
+  ]);
+  const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+  const NUM_RE = /^(?:0[xX][0-9A-Fa-f']+|0[bB][01']+|\d[\d']*)(?:\.\d+)?(?:[eE][+-]?\d+)?(?:[fFlLuU]{1,4})?/;
+
+  function hipSynSpan(cls, text) {
+    return `<span class="hipSyn ${cls}">${escapeHtml(text)}</span>`;
+  }
+
+  function classifyIdent(word, nextCh) {
+    if (HIP_ATTR.has(word)) return "attr";
+    if (CPP_KW.has(word)) return "kw";
+    if (CPP_TYPE.has(word)) return "type";
+    if (/^[A-Z][A-Z0-9_]*$/.test(word)) return "macro";
+    if (nextCh === "(" || nextCh === "<") return "fn";
+    return "";
+  }
+
+  // Lightweight C++ highlighter for the HIP snapshot pane. Not a full parser, but enough to
+  // separate comments, preprocessor lines, literals, keywords, types, and call sites.
+  function highlightCppLine(text, inBlockComment) {
+    const s = String(text ?? "");
+    let i = 0;
+    let out = "";
+    let block = !!inBlockComment;
+
+    const peekNonSpace = (j) => {
+      while (j < s.length && /\s/.test(s[j])) j++;
+      return j < s.length ? s[j] : "";
+    };
+
+    while (i < s.length) {
+      const ch = s[i];
+      if (block) {
+        const end = s.indexOf("*/", i);
+        if (end < 0) {
+          out += hipSynSpan("com", s.slice(i));
+          return { html: out, inBlockComment: true };
+        }
+        out += hipSynSpan("com", s.slice(i, end + 2));
+        i = end + 2;
+        block = false;
+        continue;
+      }
+      if (ch === "/" && s[i + 1] === "/") {
+        out += hipSynSpan("com", s.slice(i));
+        break;
+      }
+      if (ch === "/" && s[i + 1] === "*") {
+        const end = s.indexOf("*/", i + 2);
+        if (end < 0) {
+          out += hipSynSpan("com", s.slice(i));
+          return { html: out, inBlockComment: true };
+        }
+        out += hipSynSpan("com", s.slice(i, end + 2));
+        i = end + 2;
+        continue;
+      }
+      if (ch === "#") {
+        out += hipSynSpan("pre", s.slice(i));
+        break;
+      }
+      if (ch === '"' || ch === "'") {
+        const q = ch;
+        let j = i + 1;
+        while (j < s.length) {
+          if (s[j] === "\\") { j += 2; continue; }
+          if (s[j] === q) { j++; break; }
+          j++;
+        }
+        out += hipSynSpan("str", s.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (/[0-9.]/.test(ch)) {
+        const m = s.slice(i).match(NUM_RE);
+        if (m) {
+          out += hipSynSpan("num", m[0]);
+          i += m[0].length;
+          continue;
+        }
+      }
+      const idm = s.slice(i).match(IDENT_RE);
+      if (idm) {
+        const word = idm[0];
+        const nextCh = peekNonSpace(i + word.length);
+        const cls = classifyIdent(word, nextCh);
+        out += cls ? hipSynSpan(cls, word) : escapeHtml(word);
+        i += word.length;
+        continue;
+      }
+      out += escapeHtml(ch);
+      i++;
+    }
+    return { html: out, inBlockComment: block };
   }
 
   // Wraps every [a,b) slice of `s` listed in `ranges` in a search-highlight span. Ranges are
@@ -598,6 +723,59 @@
     const s = String(text || "").trim();
     if (!s) return "";
     return (s.split(/\s+/)[0] || "").trim();
+  }
+
+  function lookupIsaInfo(text) {
+    const isa = window.ATT_ISA;
+    if (!isa || !isa.lookup || !currentIsaIndex) return null;
+    return isa.lookup(mnemOfLineText(text), currentIsaIndex);
+  }
+
+  function formatIsaTip(info, mnem) {
+    const head = [
+      info.archName || currentIsaKey || "ISA",
+      info.isaKey ? `(${info.isaKey})` : "",
+      info.official && info.official.toLowerCase() !== mnem.toLowerCase() ? `[${info.official}]` : "",
+    ].filter(Boolean).join(" · ");
+    let out = `${mnem}\n[${head}]`;
+    if (currentGpuArch) out += `\ngfx target: ${currentGpuArch}`;
+    out += `\n\n${info.def}`;
+    if (info.group) out += `\n\nGroup: ${info.group}`;
+    if (info.usage) out += `\n\nOperands: ${info.usage}`;
+    if (info.matched === "prefix" && info.key && info.key !== mnem.toLowerCase()) {
+      out += `\n\n(matched family: ${info.key})`;
+    }
+    if (info.source) out += `\n\nSource: AMD machine-readable ISA (${info.source})`;
+    return out;
+  }
+
+  function positionDisIsaTip(ev) {
+    if (!disTip) return;
+    const pad = 12;
+    disTip.style.display = "block";
+    const r = disTip.getBoundingClientRect();
+    let x = ev.clientX + pad;
+    let y = ev.clientY + pad;
+    if (x + r.width > window.innerWidth - 8) x = ev.clientX - r.width - pad;
+    if (y + r.height > window.innerHeight - 8) y = ev.clientY - r.height - pad;
+    disTip.style.left = `${Math.max(8, x)}px`;
+    disTip.style.top = `${Math.max(8, y)}px`;
+  }
+
+  function showDisIsaTip(ev, asmText) {
+    if (!disTip || sourceMode !== "disasm") return;
+    const mnem = mnemOfLineText(asmText);
+    const info = lookupIsaInfo(asmText);
+    if (!info) {
+      hideDisIsaTip();
+      return;
+    }
+    disTip.textContent = formatIsaTip(info, mnem);
+    positionDisIsaTip(ev);
+  }
+
+  function hideDisIsaTip() {
+    if (disTip) disTip.style.display = "none";
   }
 
   // Producer predicates, one per hardware counter. gfx12 renamed the DS ops
@@ -814,6 +992,7 @@
   let hipBody = null;
   let hipFileSel = null;
   let hipMetaEl = null;
+  let hipStackWrap = null;
   let hipStackEl = null;
   let tabDisasmBtn = null;
   let tabOccBtn = null;
@@ -943,6 +1122,26 @@
     return i >= 0 ? s.slice(i + 1) : s;
   }
 
+  function isSourceCaptured(file) {
+    if (!file) return false;
+    return capturedBasenames.has(baseName(file));
+  }
+
+  function refreshCapturedBasenames() {
+    capturedBasenames = new Set(
+      srcSnapshot && Array.isArray(srcSnapshot.captured) ? srcSnapshot.captured : []
+    );
+  }
+
+  function firstCapturedStackFrame() {
+    if (!hipStack || !hipStack.length) return 0;
+    if (hipSourceFallback) return 0;
+    for (let i = 0; i < hipStack.length; i++) {
+      if (isSourceCaptured(hipStack[i].file)) return i;
+    }
+    return 0;
+  }
+
   function ensureHipDom() {
     if (hipPane || !sourcePane) return;
     hipDivider = document.createElement("div");
@@ -968,9 +1167,16 @@
     closeBtn.addEventListener("click", () => setHipOpen(false));
     head.appendChild(closeBtn);
 
+    hipStackWrap = document.createElement("div");
+    hipStackWrap.className = "hipStackWrap";
+    const hipStackHead = document.createElement("div");
+    hipStackHead.className = "hipStackHead";
+    hipStackHead.textContent = "Call stack";
     hipStackEl = document.createElement("div");
     hipStackEl.className = "hipStack";
     hipStackEl.title = "Inline call stack for the selected instruction; click a frame to jump";
+    hipStackWrap.appendChild(hipStackHead);
+    hipStackWrap.appendChild(hipStackEl);
 
     hipBody = document.createElement("div");
     hipBody.className = "hipBody";
@@ -982,7 +1188,7 @@
     });
 
     hipPane.appendChild(head);
-    hipPane.appendChild(hipStackEl);
+    hipPane.appendChild(hipStackWrap);
     hipPane.appendChild(hipBody);
     sourcePane.appendChild(hipDivider);
     sourcePane.appendChild(hipPane);
@@ -1047,6 +1253,7 @@
     }
     applyHipLayout();
     updateHipBtn();
+    renderHipStack();
     scheduleSaveUiState();
   }
 
@@ -1094,12 +1301,12 @@
     vscode.postMessage({ type: "requestSource", path: p });
   }
 
-  function onSourceText(pathStr, text, snapshotPath) {
+  function onSourceText(pathStr, text, snapshotPath, fromFallback) {
     const lines = String(text == null ? "" : text).split(/\r?\n/);
     hipTextCache.set(pathStr, lines);
-    // The dropdown was built before the host said which copy it read, so let it say so now.
-    if (snapshotPath && hipSnapOf.get(pathStr) !== snapshotPath) {
-      hipSnapOf.set(pathStr, snapshotPath);
+    const snapLabel = fromFallback ? "(working tree — not captured with trace)" : snapshotPath || "";
+    if (hipSnapOf.get(pathStr) !== snapLabel) {
+      hipSnapOf.set(pathStr, snapLabel);
       renderHipFileSel();
     }
     if (pathStr !== hipFile) return;
@@ -1140,6 +1347,7 @@
       return;
     }
     const frag = document.createDocumentFragment();
+    let inBlockComment = false;
     for (let i = 0; i < hipLines.length; i++) {
       const lineNo = i + 1;
       const idxs = srcLineIndex.get(`${hipFile}|${lineNo}`);
@@ -1156,20 +1364,26 @@
       num.textContent = String(lineNo);
       const txt = document.createElement("div");
       txt.className = "hipTxt";
-      txt.textContent = hipLines[i];
+      const hl = highlightCppLine(hipLines[i], inBlockComment);
+      inBlockComment = hl.inBlockComment;
+      txt.innerHTML = hl.html || "&nbsp;";
       row.appendChild(num);
       row.appendChild(txt);
       frag.appendChild(row);
     }
     hipBody.appendChild(frag);
     const n = srcFiles.find((f) => f.file === hipFile);
+    const snap = hipSnapOf.get(hipFile);
+    const fallback = snap && snap.startsWith("(working tree");
     if (hipMetaEl) {
-      hipMetaEl.textContent = `${n ? `${n.count} instr · ` : ""}snapshot`;
-      const snap = hipSnapOf.get(hipFile);
+      hipMetaEl.textContent = `${n ? `${n.count} instr · ` : ""}${fallback ? "working tree" : "snapshot"}`;
       hipMetaEl.title =
-        `The text is the copy rocprof saved with the trace${snap ? `:\n${snap}` : ""}\n` +
-        "not the file in the working tree, which the line numbers would no longer fit once it " +
-        "is edited.";
+        fallback
+          ? `Read from the compile-time path on disk because rocprof did not save a snapshot.\n` +
+            `${hipFile}\nLine numbers match only while this file matches the build that produced the trace.`
+          : `The text is the copy rocprof saved with the trace${snap ? `:\n${snap}` : ""}\n` +
+            "not the file in the working tree, which the line numbers would no longer fit once it " +
+            "is edited.";
     }
     paintHipMarks();
   }
@@ -1210,7 +1424,12 @@
     hipStack = null;
     hipStackFrame = 0;
     hipStackLoading = false;
+    hipStackError = "";
     renderHipStack();
+  }
+
+  function hasHipStackSelection() {
+    return !!(selected && selected.marker_id === currentMarkerId && Number.isFinite(Number(selected.pc)));
   }
 
   function requestHipStack(pc) {
@@ -1225,6 +1444,7 @@
     }
     hipStackLoading = true;
     hipStack = null;
+    hipStackError = "";
     renderHipStack();
     const reqId = ++hipStackReq;
     vscode.postMessage({
@@ -1239,33 +1459,57 @@
   function renderHipStack() {
     if (!hipStackEl) return;
     hipStackEl.innerHTML = "";
+    if (!hipOpen) {
+      if (hipStackWrap) hipStackWrap.style.display = "none";
+      return;
+    }
+    if (hipStackWrap) hipStackWrap.style.display = "";
     if (hipStackLoading) {
-      const note = document.createElement("div");
-      note.className = "hipStackNote";
-      note.textContent = "Resolving call stack…";
-      hipStackEl.appendChild(note);
-      hipStackEl.style.display = "";
+      appendHipStackNote("Resolving call stack…");
+      return;
+    }
+    if (hipStackError) {
+      appendHipStackNote(hipStackError, true);
+      return;
+    }
+    if (!hasHipStackSelection()) {
+      appendHipStackNote("Select an instruction in the listing or timeline.");
       return;
     }
     if (!hipStack || !hipStack.length) {
-      hipStackEl.style.display = "none";
+      appendHipStackNote("No inline call stack for this instruction.");
       return;
     }
-    hipStackEl.style.display = "";
     const frag = document.createDocumentFragment();
     for (let i = 0; i < hipStack.length; i++) {
       const fr = hipStack[i];
+      const captured = isSourceCaptured(fr.file);
       const row = document.createElement("button");
       row.type = "button";
       row.className = "hipStackFrame";
       row.classList.toggle("active", i === hipStackFrame);
+      row.classList.toggle("uncaptured", !captured && !hipSourceFallback);
       const where = `${baseName(fr.file)}:${fr.line}`;
       row.textContent = `#${i}  ${fr.func || "?"}  ${where}`;
-      row.title = `${fr.func || "?"}\n${fr.file}:${fr.line}`;
-      row.addEventListener("click", () => selectHipStackFrame(i));
+      row.title = captured || hipSourceFallback
+        ? `${fr.func || "?"}\n${fr.file}:${fr.line}`
+        : `${fr.func || "?"}\n${fr.file}:${fr.line}\n\nNo capture-time snapshot yet; ` +
+          "will read the compile-time path from disk when selected.";
+      if (captured || hipSourceFallback) {
+        row.addEventListener("click", () => selectHipStackFrame(i));
+      } else {
+        row.disabled = true;
+      }
       frag.appendChild(row);
     }
     hipStackEl.appendChild(frag);
+  }
+
+  function appendHipStackNote(text, isError) {
+    const note = document.createElement("div");
+    note.className = isError ? "hipStackNote err" : "hipStackNote";
+    note.textContent = String(text || "");
+    hipStackEl.appendChild(note);
   }
 
   function selectHipStackFrame(i) {
@@ -1278,7 +1522,9 @@
   function selectedStackPos() {
     if (hipStack && hipStack.length > hipStackFrame) {
       const fr = hipStack[hipStackFrame];
-      if (fr && fr.file) return { file: fr.file, line: fr.line };
+      if (fr && fr.file && (isSourceCaptured(fr.file) || hipSourceFallback)) {
+        return { file: fr.file, line: fr.line };
+      }
     }
     return selectedSrcPos();
   }
@@ -1333,6 +1579,7 @@
     if (tabDisasmBtn) tabDisasmBtn.classList.toggle("active", mode === "disasm");
     if (tabOccBtn) tabOccBtn.classList.toggle("active", mode === "occ");
     if (srcBody) srcBody.classList.toggle("noPad", mode === "disasm");
+    hideDisIsaTip();
     hideDisMenu();
     if (mode === "disasm") {
       renderDisasm(disasmLines);
@@ -2368,6 +2615,15 @@
             selected = { marker_id: currentMarkerId, pc: pcNow, lane: selected ? selected.lane : 0, issue: selected ? selected.issue : 0 };
             setSourceMode("occ");
           });
+          row.addEventListener("mouseenter", (ev) => {
+            const idx = Number(row.dataset.line);
+            const ln = disasmLines[idx];
+            if (ln) showDisIsaTip(ev, ln.text);
+          });
+          row.addEventListener("mousemove", (ev) => {
+            if (disTip && disTip.style.display === "block") positionDisIsaTip(ev);
+          });
+          row.addEventListener("mouseleave", hideDisIsaTip);
           row._bound = true;
         }
         row.dataset.addr = String(pc);
@@ -2377,7 +2633,10 @@
     }
 
     // scroll handler for virtualization
-    const onScroll = () => updateVisible();
+    const onScroll = () => {
+      hideDisIsaTip();
+      updateVisible();
+    };
     srcBody.removeEventListener("scroll", srcBody._disScroll || (()=>{}));
     srcBody._disScroll = onScroll;
     srcBody.addEventListener("scroll", onScroll, { passive: true });
@@ -2562,6 +2821,11 @@
     if (msg.type === "disasm" && msg.lines) {
       // Before rendering: the pane's availability is decided while the new listing is indexed.
       if (msg.sourceSnapshot !== undefined) srcSnapshot = msg.sourceSnapshot;
+      if (msg.hipSourceFallback !== undefined) hipSourceFallback = !!msg.hipSourceFallback;
+      refreshCapturedBasenames();
+      currentGpuArch = msg.gpuArch || "";
+      currentIsaKey = msg.isaKey || "";
+      currentIsaIndex = msg.isaIndex || null;
       renderDisasm(msg.lines);
       updateWaitSelFromSelected();
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
@@ -2569,15 +2833,20 @@
       const p = msg.codeobjPath || currentCodeobjPath;
       setSrcMeta(`Source: ${baseName(p) || "?"} failed (${msg.error || "error"})`, p);
     } else if (msg.type === "source") {
-      onSourceText(msg.path, msg.text, msg.snapshotPath);
+      if (msg.sourceSnapshot) {
+        srcSnapshot = msg.sourceSnapshot;
+        refreshCapturedBasenames();
+      }
+      onSourceText(msg.path, msg.text, msg.snapshotPath, !!msg.fromFallback);
     } else if (msg.type === "sourceError") {
       onSourceError(msg.path, msg.error);
     } else if (msg.type === "inlineStack") {
       if (msg.reqId !== hipStackReq) return;
       if (msg.markerId !== currentMarkerId) return;
       hipStackLoading = false;
+      hipStackError = msg.error ? String(msg.error) : "";
       hipStack = Array.isArray(msg.stack) && msg.stack.length ? msg.stack : null;
-      hipStackFrame = 0;
+      hipStackFrame = firstCapturedStackFrame();
       renderHipStack();
       syncHipToSelected();
     }

@@ -2,7 +2,7 @@
   "name": "att-trace-viewer",
   "displayName": "ATT Trace Viewer",
   "description": "View ROCm Advanced Thread Trace (ATT) in a VS Code webview timeline",
-  "version": "0.0.56",
+  "version": "0.0.64",
   "publisher": "jfactory07",
   "license": "MIT",
   "repository": {
@@ -83,6 +83,16 @@
           "type": "string",
           "default": "/opt/rocm/llvm/bin/llvm-objdump",
           "description": "Path to llvm-objdump used for disassembly in the source panel"
+        },
+        "attViewer.hipSourceSnapshotOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the HIP pane reads only rocprof capture snapshots and never falls back to the compile-time path on disk. Leave false for normal development: missing headers (common for DWARF-only inlining) are read from disk and optionally copied into the capture."
+        },
+        "attViewer.hipAutoSnapshotFill": {
+          "type": "boolean",
+          "default": true,
+          "description": "When falling back to the compile-time path, copy the file into ui_output_*/source_*_<basename> so later opens and other machines use the snapshot. Run bench/att_fill_sources.py after capture to batch-fill existing traces."
         }
       }
     }

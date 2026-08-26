@@ -1,0 +1,32 @@
+{
+  "gfxToIsa": {
+    "gfx908": "cdna1",
+    "gfx90a": "cdna2",
+    "gfx942": "cdna3",
+    "gfx950": "cdna4",
+    "gfx1010": "rdna1",
+    "gfx1011": "rdna1",
+    "gfx1012": "rdna1",
+    "gfx1030": "rdna2",
+    "gfx1031": "rdna2",
+    "gfx1032": "rdna2",
+    "gfx1100": "rdna3",
+    "gfx1101": "rdna3",
+    "gfx1102": "rdna3",
+    "gfx1150": "rdna3_5",
+    "gfx1151": "rdna3_5",
+    "gfx1200": "rdna4",
+    "gfx1201": "rdna4"
+  },
+  "isaKeys": [
+    "cdna1",
+    "cdna2",
+    "cdna3",
+    "cdna4",
+    "rdna1",
+    "rdna2",
+    "rdna3",
+    "rdna3_5",
+    "rdna4"
+  ]
+}

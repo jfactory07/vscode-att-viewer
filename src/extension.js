@@ -5,7 +5,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 
 function fileExists(p) {
   try {
@@ -41,6 +41,15 @@ function pickResultsDb(attPath) {
 // captured at 1112 lines is 1166 in the tree, so every attribution below the first insertion
 // points at the wrong statement -- and a `-gline-tables-only` line table carries no file checksum
 // to catch it. So the panel reads the capture-time copy and never the working tree.
+function nextSourceSnapshotPath(snapshotDir, base) {
+  let maxN = -1;
+  for (const name of fs.readdirSync(snapshotDir)) {
+    const m = name.match(/^source_(\d+)_/);
+    if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+  }
+  return path.join(snapshotDir, `source_${maxN + 1}_${base}`);
+}
+
 function findSourceSnapshotDir(attPath) {
   const dir = path.dirname(attPath);
   // e.g. zrow_16742_shader_engine_0_338.att -> ui_output_agent_16742_dispatch_338
@@ -102,6 +111,9 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
   const styleUri = webview.asWebviewUri(
     vscode.Uri.joinPath(ctx.extensionUri, "media", "viewer.css")
   );
+  const isaRefUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(ctx.extensionUri, "media", "isa_lookup.js")
+  );
   const nonce = Math.random().toString(36).slice(2);
 
   // CSP: allow loading our script/style and fetching localResourceRoots URIs
@@ -149,12 +161,14 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
           <div id="srcMeta">Source</div>
         </div>
         <div class="sourceBody" id="srcBody"></div>
+        <div class="disTip" id="disTip"></div>
       </div>
     </div>
     <script nonce="${nonce}">
       window.__ATT_JSON_URI__ = "${jsonUri.toString()}";
       window.__ATT_TRACE_KEY__ = "${String(traceKey || "")}";
     </script>
+    <script nonce="${nonce}" src="${isaRefUri}"></script>
     <script nonce="${nonce}" src="${scriptUri}"></script>
   </body>
 </html>`;
@@ -380,7 +394,15 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   // so the HIP pane can say why it has nothing to show when a capture saved no sources.
   const snapshotDir = findSourceSnapshotDir(attPath);
   const snapshotByBase = indexSourceSnapshot(snapshotDir);
-  const sourceSnapshot = { dir: snapshotDir || "", files: snapshotByBase.size };
+  const sourceSnapshot = {
+    dir: snapshotDir || "",
+    files: snapshotByBase.size,
+    captured: [...snapshotByBase.keys()].sort(),
+  };
+  const attCfg = vscode.workspace.getConfiguration("attViewer");
+  const hipSourceSnapshotOnly = !!attCfg.get("hipSourceSnapshotOnly", false);
+  const hipAutoSnapshotFill = !!attCfg.get("hipAutoSnapshotFill", true);
+  const hipSourceFallback = !hipSourceSnapshotOnly;
   // Source paths named by the line tables we have parsed. The webview asks the host to read
   // HIP files by path, so answer only for files a code object actually points at.
   const knownSourceFiles = new Set();
@@ -390,6 +412,9 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   const rememberStackFiles = (stack) => {
     for (const fr of stack) if (fr.file) knownSourceFiles.add(fr.file);
   };
+
+  const isaManifestCache = { value: loadIsaManifest(context.extensionUri) };
+  const isaIndexCache = new Map();
 
   // Persisted color config (global across traces)
   const getSavedColors = () => context.globalState.get("attViewer.colors", null);
@@ -427,12 +452,17 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       const codeobjPath = msg.codeobjPath;
       if (!codeobjPath) return;
       if (disasmCache.has(codeobjPath)) {
+        const isa = isaPayloadForCodeobj(context.extensionUri, isaManifestCache, isaIndexCache, codeobjPath);
         panel.webview.postMessage({
           type: "disasm",
           markerId: msg.markerId,
           codeobjPath,
           lines: disasmCache.get(codeobjPath),
           sourceSnapshot,
+          hipSourceFallback,
+          gpuArch: isa.gpuArch,
+          isaKey: isa.isaKey,
+          isaIndex: isa.isaIndex,
         });
         return;
       }
@@ -440,12 +470,17 @@ async function openAttImpl(context, attUri, existingPanel = null) {
         const lines = await runObjdump(llvmObjdumpPath, codeobjPath);
         disasmCache.set(codeobjPath, lines);
         rememberSourceFiles(lines);
+        const isa = isaPayloadForCodeobj(context.extensionUri, isaManifestCache, isaIndexCache, codeobjPath);
         panel.webview.postMessage({
           type: "disasm",
           markerId: msg.markerId,
           codeobjPath,
           lines,
           sourceSnapshot,
+          hipSourceFallback,
+          gpuArch: isa.gpuArch,
+          isaKey: isa.isaKey,
+          isaIndex: isa.isaIndex,
         });
       } catch (e) {
         panel.webview.postMessage({
@@ -471,6 +506,10 @@ async function openAttImpl(context, attUri, existingPanel = null) {
         });
       if (!codeobjPath || !Number.isFinite(addr)) {
         fail("missing code object or address");
+        return;
+      }
+      if (!fileExists(llvmSymbolizerPath)) {
+        fail(`llvm-symbolizer not found at ${llvmSymbolizerPath}`);
         return;
       }
       const cacheKey = `${codeobjPath}|${addr}`;
@@ -514,17 +553,33 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       // The copies carry a file name and no directory, so a capture that saved two same-named
       // files from different directories cannot be told apart. Say so rather than guess.
       const cands = snapshotByBase.get(base) || [];
-      if (cands.length !== 1) {
-        fail(
-          cands.length === 0
-            ? `not captured at profile time (no source_*_${base} in ${path.basename(snapshotDir)})`
-            : `${cands.length} captured copies are named ${base}, so this path is ambiguous`
-        );
+      let readPath = null;
+      let fromFallback = false;
+      if (cands.length === 1) {
+        readPath = cands[0];
+      } else if (cands.length === 0) {
+        const allowFallback = hipSourceFallback;
+        if (allowFallback && fileExists(srcPath)) {
+          readPath = srcPath;
+          fromFallback = true;
+        } else {
+          fail(
+            allowFallback
+              ? `not captured at profile time (no source_*_${base} in ${path.basename(snapshotDir)}); ` +
+                  `${srcPath} is not readable on disk`
+              : `not captured at profile time (no source_*_${base} in ${path.basename(snapshotDir)}). ` +
+                  "rocprof saves only line-table files; call-stack frames from DWARF inlining may " +
+                  "name headers with no snapshot. Turn off attViewer.hipSourceSnapshotOnly to read " +
+                  "the compile-time path from disk (auto-saved into the capture when enabled)."
+          );
+          return;
+        }
+      } else {
+        fail(`${cands.length} captured copies are named ${base}, so this path is ambiguous`);
         return;
       }
-      const snapPath = cands[0];
       try {
-        const st = fs.statSync(snapPath);
+        const st = fs.statSync(readPath);
         if (!st.isFile()) {
           fail("the captured copy is not a file");
           return;
@@ -533,11 +588,27 @@ async function openAttImpl(context, attUri, existingPanel = null) {
           fail(`too large (${(st.size / 1048576).toFixed(1)} MiB)`);
           return;
         }
+        let snapshotPath = readPath;
+        if (fromFallback && hipAutoSnapshotFill && snapshotDir) {
+          try {
+            const dest = nextSourceSnapshotPath(snapshotDir, base);
+            fs.copyFileSync(readPath, dest);
+            snapshotByBase.set(base, [dest]);
+            sourceSnapshot.captured = [...snapshotByBase.keys()].sort();
+            sourceSnapshot.files = snapshotByBase.size;
+            snapshotPath = dest;
+            fromFallback = false;
+          } catch {
+            // ui_output not writable — still serve from compile-time path
+          }
+        }
         panel.webview.postMessage({
           type: "source",
           path: srcPath,
-          snapshotPath: snapPath,
-          text: fs.readFileSync(snapPath, "utf8"),
+          snapshotPath: fromFallback ? "" : snapshotPath,
+          fromFallback,
+          sourceSnapshot: fromFallback ? undefined : { ...sourceSnapshot },
+          text: fs.readFileSync(readPath, "utf8"),
         });
       } catch (e) {
         fail(String(e && e.message ? e.message : e));
@@ -556,15 +627,22 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   }
 }
 
+function parseSourceLocation(loc) {
+  const s = String(loc || "").trim();
+  // Non-greedy file match: `kernel.h:525:13` must not capture `:525` in the path.
+  const m = s.match(/^(.+?):(\d+)(?::(\d+))?$/);
+  if (!m || m[1] === "??") return null;
+  return { file: m[1], line: parseInt(m[2], 10) };
+}
+
 function parseInlineStack(out) {
   const lines = String(out || "").split(/\r?\n/).filter((l) => l.length > 0);
   const stack = [];
   for (let i = 0; i + 1 < lines.length; i += 2) {
     const func = lines[i].trim();
-    const loc = lines[i + 1].trim();
-    const m = loc.match(/^(.+):(\d+)(?::(\d+))?$/);
-    if (!m || m[1] === "??") continue;
-    stack.push({ func, file: m[1], line: parseInt(m[2], 10) });
+    const pos = parseSourceLocation(lines[i + 1]);
+    if (!pos) continue;
+    stack.push({ func, file: pos.file, line: pos.line });
   }
   return stack;
 }
@@ -607,19 +685,25 @@ function runObjdump(objdump, codeobjPath) {
       const re = /\/\/\s+([0-9A-Fa-f]+):/;
       // "; <mangled>():" marks a function, "; <path>:<line>" a source position. Only the
       // latter carries a colon-separated decimal tail, so match that and let the rest through.
-      const posRe = /^;\s+(\S.*):(\d+)$/;
+      const posRe = /^;\s+(.+)$/;
       let curFile = "";
       let curLine = 0;
       for (const ln of out.split(/\r?\n/)) {
         if (ln.startsWith(";")) {
           const pm = ln.match(posRe);
           if (pm) {
-            curFile = pm[1];
-            curLine = parseInt(pm[2], 10);
-          } else if (ln.endsWith("():")) {
-            // A new function: do not let its first instructions inherit the previous position.
-            curFile = "";
-            curLine = 0;
+            const tail = pm[1];
+            if (tail.endsWith("():")) {
+              // A new function: do not let its first instructions inherit the previous position.
+              curFile = "";
+              curLine = 0;
+            } else {
+              const pos = parseSourceLocation(tail);
+              if (pos) {
+                curFile = pos.file;
+                curLine = pos.line;
+              }
+            }
           }
           continue;
         }
@@ -681,6 +765,71 @@ function runPython(pythonExe, scriptPath, args, env) {
   });
 }
 
+function loadIsaManifest(extensionUri) {
+  const p = path.join(extensionUri.fsPath, "media", "isa", "manifest.json");
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+function inferGpuArch(codeobjPath) {
+  const base = path.basename(codeobjPath);
+  let m = base.match(/(gfx\d+[a-z]?)/i);
+  if (m) return m[1].toLowerCase();
+  try {
+    const out = execSync(`readelf -n ${JSON.stringify(codeobjPath)}`, {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+    });
+    m = out.match(/amdhsa\.target:\s+\S+--(gfx\d+[a-z]?)/i);
+    if (m) return m[1].toLowerCase();
+  } catch {
+    /* code object may not carry notes */
+  }
+  return "";
+}
+
+function isaKeyForGpuArch(gpuArch, manifest) {
+  const key = String(gpuArch || "").toLowerCase();
+  if (manifest.gfxToIsa[key]) return manifest.gfxToIsa[key];
+  if (key.startsWith("gfx95")) return "cdna4";
+  if (key.startsWith("gfx94")) return "cdna3";
+  if (key === "gfx908") return "cdna1";
+  if (key === "gfx90a") return "cdna2";
+  if (key.startsWith("gfx12")) return "rdna4";
+  if (key.startsWith("gfx115")) return "rdna3_5";
+  if (key.startsWith("gfx11")) return "rdna3";
+  if (key.startsWith("gfx10")) return "rdna2";
+  return "cdna4";
+}
+
+function loadIsaIndex(extensionUri, isaKey) {
+  const p = path.join(extensionUri.fsPath, "media", "isa", `${isaKey}.json`);
+  if (!fileExists(p)) return null;
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+function isaPayloadForCodeobj(extensionUri, manifestCache, indexCache, codeobjPath) {
+  const manifest = manifestCache.value;
+  const gpuArch = inferGpuArch(codeobjPath);
+  const isaKey = isaKeyForGpuArch(gpuArch, manifest);
+  let idx = indexCache.get(isaKey);
+  if (!idx) {
+    idx = loadIsaIndex(extensionUri, isaKey);
+    if (idx) indexCache.set(isaKey, idx);
+  }
+  return {
+    gpuArch: gpuArch || "unknown",
+    isaKey,
+    isaIndex: idx
+      ? {
+          isaKey: idx.isaKey,
+          archName: idx.archName,
+          source: idx.source,
+          instructions: idx.instructions,
+        }
+      : null,
+  };
+}
+
 function deactivate() {}
 
 // runObjdump is exported so the listing parser can be tested against a real code object
@@ -691,6 +840,7 @@ module.exports = {
   runObjdump,
   runSymbolizerInlineStack,
   parseInlineStack,
+  parseSourceLocation,
   findSourceSnapshotDir,
   indexSourceSnapshot,
 };

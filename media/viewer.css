@@ -238,19 +238,29 @@ html, body {
   padding: 2px 4px;
 }
 .hipMeta { flex: 0 0 auto; color: rgba(255,255,255,0.55); font-size: 11px; white-space: nowrap; }
-.hipStack {
-  display: none;
-  max-height: 132px;
-  overflow: auto;
+.hipStackWrap {
   border-bottom: 1px solid rgba(255,255,255,0.08);
   background: rgba(0,0,0,0.18);
 }
+.hipStackHead {
+  padding: 3px 8px 0;
+  color: rgba(255,255,255,0.45);
+  font-size: 10px;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.hipStack {
+  max-height: 132px;
+  overflow: auto;
+}
 .hipStackNote {
-  padding: 4px 8px;
+  padding: 4px 8px 6px;
   color: rgba(255,255,255,0.45);
   font-size: 11px;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }
+.hipStackNote.err { color: rgba(255,140,120,0.92); }
 .hipStackFrame {
   display: block;
   width: 100%;
@@ -273,6 +283,12 @@ html, body {
   color: rgba(255,255,255,0.95);
   box-shadow: inset 3px 0 0 rgba(255,255,255,0.45);
 }
+.hipStackFrame.uncaptured {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.hipStackFrame.uncaptured:hover { background: transparent; }
+.hipStackFrame:disabled { opacity: 0.45; cursor: not-allowed; }
 .hipBody {
   overflow: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
@@ -282,16 +298,43 @@ html, body {
 .hipRow { display: grid; grid-template-columns: 48px minmax(0, 1fr); align-items: center; cursor: default; }
 /* lines that produced no instruction stay dim: inlined away, or never compiled for this config */
 .hipRow .hipNum { padding-right: 8px; text-align: right; color: rgba(255,255,255,0.25); user-select: none; }
-.hipRow .hipTxt { white-space: pre; overflow: hidden; text-overflow: ellipsis; color: rgba(255,255,255,0.42); }
+.hipRow .hipTxt { white-space: pre; overflow: hidden; text-overflow: ellipsis; color: rgba(220,220,220,0.92); }
+.hipRow:not(.hasAsm) .hipTxt { opacity: 0.42; }
 .hipRow.hasAsm { cursor: pointer; }
 .hipRow.hasAsm .hipNum { color: rgba(120, 220, 140, 0.75); }
-.hipRow.hasAsm .hipTxt { color: rgba(255,255,255,0.92); }
+.hipRow.hasAsm .hipTxt { opacity: 1; }
+.hipSyn.kw { color: #c586c0; }
+.hipSyn.type { color: #4ec9b0; }
+.hipSyn.fn { color: #dcdcaa; }
+.hipSyn.macro { color: #bd63c5; }
+.hipSyn.attr { color: #9cdcfe; }
+.hipSyn.num { color: #b5cea8; }
+.hipSyn.str { color: #ce9178; }
+.hipSyn.com { color: #6a9955; font-style: italic; }
+.hipSyn.pre { color: #c586c0; }
 .hipRow.hasAsm:hover { background: rgba(255,255,255,0.06); }
 /* the line the clicked instruction came from */
 .hipRow.cur { background: rgba(255,255,255,0.14); box-shadow: inset 3px 0 0 rgba(255,255,255,0.45); }
 /* the line the reader clicked here, matching the tint on the instructions it compiled to */
 .hipRow.sel { background: rgba(120, 220, 140, 0.18); box-shadow: inset 3px 0 0 rgba(120, 220, 140, 0.85); }
-.disMenu {
+.disTip {
+  position: fixed;
+  z-index: 45;
+  display: none;
+  max-width: 520px;
+  background: rgba(18, 20, 24, 0.96);
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: rgba(255,255,255,0.92);
+  box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+  pointer-events: none;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.disRow:hover .disTextCell { text-decoration: underline dotted rgba(255,255,255,0.25); text-underline-offset: 2px; }
   position: fixed;
   z-index: 40;
   min-width: 200px;

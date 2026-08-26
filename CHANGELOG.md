@@ -4,6 +4,20 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- Disassembly hover help now uses **architecture-aware** indexes built from AMD's official
+  machine-readable ISA XML (GPUOpen). The gfx target is inferred from the code object
+  (`gfx950` in the file name or `readelf -n` notes) and only definitions from the matching
+  CDNA/RDNA generation are shown, with arch name, functional group, operands, and XML source cited
+- Disassembly: hover an instruction row to see a short ISA definition, operand syntax, and notes
+  (replaces the earlier hand-written mnemonic cheat sheet)
+- HIP source pane: C++ syntax highlighting (keywords, types, functions, macros, literals,
+  comments, preprocessor, HIP attributes). Lines that compiled to nothing stay dimmer but keep
+  token colors
+- Keep the call stack strip visible in the HIP pane with a `Call stack` label, placeholder text
+  before an instruction is selected, and an error line when inline-stack lookup fails
+- Fix source-location parsing when DWARF carries a column (`file:line:col`): the old greedy
+  match treated `kernel.h:525` as the file name, so outer call-stack frames could not load their
+  captured snapshot even when `source_*_kernel.h` existed
 - HIP source pane: show the selected instruction's full inline call stack (via `llvm-symbolizer
   --inlining`) between the file picker and the source text; click a frame to jump to that file and
   line. Frame `#0` is the innermost site (what `--line-numbers` showed before); higher numbers walk
