@@ -4,6 +4,13 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- `attViewer.addToChatViaOutput` attaches the selection from an output view, and nothing opens
+  in the editor area. An output view is a code editor like any other, only it lives in the
+  panel, so the selection can be made in it and handed to the same command — where opening the
+  selection file meant a tab flashing past and the trace panel coming back on every click. The
+  channel is cleared before each attach and is not the one the log goes to, since whatever else
+  it held would be attached along with the selection. The editor path stays behind it as the
+  fallback
 - The selection is attached by the command the keybinding runs, `aichat.newchataction`, called
   with no arguments so that Cursor states the focused editor's selection itself. The payload
   cannot be built here: `composer.addsymbolstocomposer` takes `codeSelections` and draws the

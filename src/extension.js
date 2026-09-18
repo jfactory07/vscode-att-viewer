@@ -155,17 +155,12 @@ function selectionsDir() {
   return path.join(mcpStateDir(), "selections");
 }
 
-// Write the selected instructions somewhere Cursor can reference as a file range. That is
-// what makes the chat show them as one collapsed chip instead of a wall of text: its own
-// "add to chat" attaches a range, and a range needs a file behind it.
+// The selected instructions as the text that gets attached.
 //
-// The header says which trace this came from and what to call for the cycles. The chip is the
-// whole file, so everything in it arrives with the selection, which is what keeps that out of
-// the chat input.
-function writeSelectionFile(attPath, msg) {
+// The header says which trace this came from and what to call for the cycles. Whatever this
+// returns arrives with the selection, which is what keeps all of it out of the chat input.
+function selectionListing(attPath, msg) {
   const hex = (v) => "0x" + Number(v).toString(16);
-  const dir = selectionsDir();
-  fs.mkdirSync(dir, { recursive: true });
   const lines = Array.isArray(msg.lines) ? msg.lines : [];
   const w = Math.max(...lines.map((x) => hex(x.addr).length), 0);
   const head = [
@@ -181,11 +176,21 @@ function writeSelectionFile(attPath, msg) {
   const body = lines
     .map((x) => `${hex(x.addr).padEnd(w)}  ${x.text}`)
     .join("\n");
+  return head.join("\n") + body + "\n";
+}
+
+// Write the listing somewhere Cursor can reference as a file range. That is what makes the
+// chat show it as one collapsed chip instead of a wall of text: its own "add to chat" attaches
+// a range, and a range needs a file behind it.
+function writeSelectionFile(attPath, msg) {
+  const hex = (v) => "0x" + Number(v).toString(16);
+  const dir = selectionsDir();
+  fs.mkdirSync(dir, { recursive: true });
   const file = path.join(
     dir,
     `${path.basename(attPath, ".att")}_${hex(msg.begin)}-${hex(msg.end)}.s`
   );
-  fs.writeFileSync(file, head.join("\n") + body + "\n", "utf8");
+  fs.writeFileSync(file, selectionListing(attPath, msg), "utf8");
   return file;
 }
 
@@ -271,6 +276,45 @@ async function closeSelectionTabs() {
   if (tabs.length) await vscode.window.tabGroups.close(tabs, true);
 }
 
+// The channel the selection is attached from, created on the first attach that needs it.
+let selectionChannel = null;
+
+// Try to attach the selection from an output view, so that nothing opens in the editor area.
+//
+// An output view is a code editor like any other, only it lives in the panel: a selection can
+// be made in it and handed to the same command, and the reader is left looking at the trace
+// instead of watching a tab flash past and the panel come back. The channel is cleared first,
+// because whatever else it held would be attached along with the selection — which is also why
+// it is a channel of its own and not the one the log goes to.
+async function attachSelectionViaOutput(attPath, msg) {
+  if (!vscode.workspace.getConfiguration("attViewer").get("addToChatViaOutput")) return null;
+  const attach = ATTACH_ATTEMPTS.filter((a) => chatCommands.has(a.cmd));
+  if (attach.length === 0 || !chatCommands.has("editor.action.selectAll")) {
+    chatLog(`output: not attempted — ${attach.length} attach command(s), selectAll ${chatCommands.has("editor.action.selectAll")}`);
+    return null;
+  }
+  if (!selectionChannel) {
+    selectionChannel = vscode.window.createOutputChannel("ATT Selection");
+  }
+  selectionChannel.clear();
+  selectionChannel.append(selectionListing(attPath, msg));
+  // Focus, not just reveal: the command reads the selection of whatever is focused.
+  selectionChannel.show(false);
+  await new Promise((r) => setTimeout(r, 250));
+  try {
+    await vscode.commands.executeCommand("editor.action.selectAll");
+    await vscode.commands.executeCommand(attach[0].cmd, ...attach[0].args());
+    chatLog(`output: ${attach[0].cmd} accepted the output view's selection`);
+  } catch (e) {
+    chatLog(`output: attach failed — ${e && e.message}`);
+    return null;
+  }
+  // Written as well, so the question can name a file and a chat with no MCP server can read
+  // the selection back.
+  writeSelectionFile(attPath, msg);
+  return askAttachedQuestion(`attached from the ${selectionChannel.name} output view`, msg);
+}
+
 // Try to hand the selection over as a file range, the way Cursor's own "add to chat" does,
 // so the chat shows one collapsed chip.
 //
@@ -322,11 +366,17 @@ async function attachSelectionAsRange(attPath, msg) {
   }
 
   // "Accepted" is as far as this can be put: no command here says whether a chip appeared.
-  const via = `handed to ${took.join(" and ")}`;
+  return askAttachedQuestion(`handed to ${took.join(" and ")}`, msg);
+}
+
+// Put the question to the chat the attach command just left the focus in.
+//
+// Not by way of `composer.focusComposer`: that reaches for whichever chat was focused before,
+// and the question would be asked of the wrong conversation. Which leaves the paste going
+// wherever the focus went, so it is only made once no text editor is there to catch it — typed
+// into one it would edit the reader's file.
+async function askAttachedQuestion(via, msg) {
   await vscode.env.clipboard.writeText(attachedQuestion(msg));
-  // Focus is left wherever the attach command put it, which is the chat holding the mention it
-  // just wrote. Reaching for the composer again would be reaching for whichever chat was
-  // focused before, and the question would be asked of the wrong conversation.
   await new Promise((r) => setTimeout(r, 300));
   const editor = vscode.window.activeTextEditor;
   if (editor) {
@@ -519,6 +569,7 @@ function activate(context) {
               version: vscode.version,
               attach: ATTACH_ATTEMPTS.map((a) => a.cmd).filter((c) => chatCommands.has(c)),
               related: all.filter((c) => /chat|composer|aichat/i.test(c)).sort(),
+              output: all.filter((c) => /output|selectAll/i.test(c)).sort(),
             },
             null,
             1
@@ -811,6 +862,7 @@ async function openAttImpl(context, attUri, existingPanel = null) {
       }
       chatLog(`--- add to chat: ${n} instructions from ${path.basename(attPath)}`);
       const r =
+        (await attachSelectionViaOutput(attPath, msg)) ||
         (await attachSelectionAsRange(attPath, msg)) ||
         (await sendPromptToChat(selectionQuestion(msg, writeSelectionFile(attPath, msg))));
       chatLog(`result: ${r.how || `nothing — ${r.why}`}`);
