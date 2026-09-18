@@ -23,6 +23,12 @@
   const disTip = document.getElementById("disTip");
   const ctx = canvas.getContext("2d");
 
+  // The timeline is laid out in CSS pixels but backed by a store scaled to the display, so
+  // it stays sharp on HiDPI screens. Drawing and hit testing use these, never the backing
+  // store's own width and height.
+  let cssW = 1;
+  let cssH = 1;
+
   // webview state persistence (fallback when VS Code reloads the webview)
   function getUiState() {
     try { return vscode.getState() || null; } catch { return null; }
@@ -36,6 +42,10 @@
   // (Using `typeof view` is unsafe due to TDZ when `view` is a later `let`.)
   let _uiReady = false;
   let _drawRequestedBeforeReady = false;
+  // With the other readiness flags, not beside requestDraw far below: the replay that runs
+  // the moment _uiReady is set calls requestDraw, which would read this before its own
+  // declaration and throw where the guard exists to prevent exactly that.
+  let _drawPending = false;
   let _uiStateTimer = null;
   function scheduleSaveUiState() {
     if (!_uiReady) return;
@@ -343,6 +353,7 @@
   function openCfg() { cfg.style.display = "block"; }
   function closeCfg() { cfg.style.display = "none"; }
   if (colorsBtn) colorsBtn.addEventListener("click", () => (cfg.style.display === "none" ? openCfg() : closeCfg()));
+
   if (cfgClose) cfgClose.addEventListener("click", closeCfg);
 
   function buildCfgUI() {
@@ -997,6 +1008,16 @@
   let tabDisasmBtn = null;
   let tabOccBtn = null;
   let copyBtn = null;
+  let chatBtn = null;
+
+  // Declared here rather than beside drawPhases, which is far below: the toolbar button is
+  // wired long before that point, and a `let` read from a handler that outruns its own
+  // initialization throws instead of reading undefined. Any init step between the two that
+  // failed would leave the button live and the state unborn.
+  let PHASES = null;
+  let phasesOn = false;
+  let phaseMarks = null;
+  const PHASE_ORDER = ["prologue", "mainline", "epilogue"];
   let findInput = null;
   let findWrap = null;
   let findCountEl = null;
@@ -1064,6 +1085,13 @@
       "Click or drag rows to select, Shift+click to extend, Ctrl/Cmd+A for all lines, Esc to clear.\n" +
       "Right-click the listing for other copy formats.";
     tabs.appendChild(copyBtn);
+    chatBtn = document.createElement("button");
+    chatBtn.className = "tabBtn";
+    chatBtn.textContent = "Add to chat";
+    chatBtn.title =
+      "Attach the selected instructions to this trace's chat context, so the att_current " +
+      "MCP tool hands them to the model with the trace they came from.";
+    tabs.appendChild(chatBtn);
     tabDisasmBtn = document.createElement("button");
     tabDisasmBtn.className = "tabBtn active";
     tabDisasmBtn.textContent = "Disasm";
@@ -1593,6 +1621,23 @@
   if (tabDisasmBtn) tabDisasmBtn.addEventListener("click", () => setSourceMode("disasm"));
   if (tabOccBtn) tabOccBtn.addEventListener("click", () => setSourceMode("occ"));
   if (copyBtn) copyBtn.addEventListener("click", () => copySelection("addr"));
+  if (chatBtn) chatBtn.addEventListener("click", () => addSelectionToChat());
+
+  const phasesBtn = document.getElementById("phasesBtn");
+  if (phasesBtn) {
+    phasesBtn.addEventListener("click", () => {
+      phasesOn = !phasesOn;
+      phasesBtn.classList.toggle("active", phasesOn);
+      if (phasesOn && !PHASES) {
+        // First use analyzes the dispatch, which is why the button says so and then waits.
+        phasesBtn.disabled = true;
+        showToast("Finding the hot loop…");
+        vscode.postMessage({ type: "requestPhases" });
+        return;
+      }
+      requestDraw();
+    });
+  }
   if (findInput) {
     findInput.addEventListener("input", () => {
       disSearch.query = findInput.value;
@@ -1674,6 +1719,44 @@
     const r = disRangeBounds();
     const n = r ? r.hi - r.lo + 1 : 0;
     copyBtn.textContent = n > 0 ? `Copy ${n}` : "Copy";
+    if (!chatBtn) return;
+    chatBtn.style.display = sourceMode === "disasm" ? "" : "none";
+    chatBtn.disabled = n === 0;
+  }
+
+  // Hand the selected instructions to the MCP layer, which pairs them with the
+  // trace they came from so the model can answer questions about this selection.
+  function addSelectionToChat() {
+    const r = disRangeBounds();
+    if (!r) {
+      showToast("No disasm lines selected");
+      return;
+    }
+    const lines = [];
+    for (let i = r.lo; i <= r.hi; i++) {
+      const ln = disasmLines[i];
+      if (!ln) continue;
+      const pc = Number(ln.addr);
+      const hit = pcIndex.get(`${currentMarkerId}|${pc}`);
+      lines.push({
+        addr: pc,
+        text: String(ln.text || ""),
+        hits: hit ? hit.idxs.length : 0,
+      });
+    }
+    if (!lines.length) {
+      showToast("No disasm lines selected");
+      return;
+    }
+    vscode.postMessage({
+      type: "attachSelection",
+      codeobjPath: currentCodeobjPath,
+      markerId: currentMarkerId,
+      begin: lines[0].addr,
+      end: lines[lines.length - 1].addr,
+      lines,
+      text: buildDisasmText("addr"),
+    });
   }
 
   function disasmAddrText(pc) {
@@ -1782,6 +1865,8 @@
       ["Copy (addr + instruction)", () => copySelection("addr")],
       ["Copy instruction text only", () => copySelection("text")],
       ["Copy with per-slot counts (TSV)", () => copySelection("counts")],
+      null,
+      ["Add to chat", () => addSelectionToChat()],
       null,
       ["Select all lines", () => selectAllDisasm()],
       ["Clear selection", () => setDisRange(null)],
@@ -2818,6 +2903,33 @@
   window.addEventListener("message", (event) => {
     const msg = event.data;
     if (!msg || !msg.type) return;
+    if (msg.type === "selectionAttached") {
+      showToast(msg.toast);
+      return;
+    }
+    if (msg.type === "phases") {
+      const btn = document.getElementById("phasesBtn");
+      if (btn) btn.disabled = false;
+      if (msg.error || !msg.phases || msg.phases.begin == null) {
+        phasesOn = false;
+        if (btn) btn.classList.remove("active");
+        showToast(msg.error ? `Phases: ${msg.error}` : "No hot loop to split at");
+        return;
+      }
+      PHASES = msg.phases;
+      buildPhaseMarks();
+      const nl = (phaseMarks && phaseMarks.launches) || 1;
+      const share = (PHASES.phases || []).find((p) => p.name === "mainline");
+      showToast(
+        (nl > 1 ? `${nl} launches · ` : "") +
+          `loop 0x${PHASES.begin.toString(16)}-0x${PHASES.end.toString(16)}` +
+          (share ? ` · mainline ${share.pct.toFixed(1)}% of all wave time` : "")
+      );
+      // Not draw(): the reply can arrive while the timeline state is still being built, and
+      // requestDraw is what defers a paint until it is safe and then replays it.
+      requestDraw();
+      return;
+    }
     if (msg.type === "disasm" && msg.lines) {
       // Before rendering: the pane's availability is decided while the new listing is indexed.
       if (msg.sourceSnapshot !== undefined) srcSnapshot = msg.sourceSnapshot;
@@ -2941,6 +3053,126 @@
   let MARKERS = [];
   const MARKER_COLOR = "#ff3b30";
 
+  // Prologue / mainline / epilogue, cut at the hot loop's address range. State for these
+  // lives up with the other toolbar state, above the button that switches them on.
+  //
+  // The timeline's axis is time and the split is by address, so a phase has no single moment:
+  // a lane hosts several waves in turn and each reaches the loop on its own schedule. One
+  // line per phase is therefore approximate by construction, and it is drawn at the median
+  // entry across that launch's waves so it sits among them rather than ahead of all of them.
+  function phaseOf(e) {
+    if (!PHASES || e.marker_id !== PHASES.codeobj) return null;
+    if (e.pc < PHASES.begin) return "prologue";
+    if (e.pc <= PHASES.end) return "mainline";
+    return "epilogue";
+  }
+
+  function median(xs) {
+    const s = xs.slice().sort((a, b) => a - b);
+    return s[s.length >> 1];
+  }
+
+  // One line per phase per launch: the median over that launch's waves of when they first
+  // reached it. Per launch, because a capture can hold the same kernel dispatched more than
+  // once, and a median taken across both lands in the gap between them, describing neither.
+  function buildPhaseMarks() {
+    phaseMarks = null;
+    if (!PHASES) return;
+
+    // A wave's walk through the phases. Reaching the prologue again means a new wave took
+    // the slot, since within one wave the pc only crosses each boundary forwards.
+    const walks = [];
+    for (let lane = 0; lane < lanes; lane++) {
+      let prev = null;
+      let cur = null;
+      for (const e of eventsByLane[lane] || []) {
+        const p = phaseOf(e);
+        if (!p) continue;
+        const t = e.issue || 0;
+        if (p !== prev && (p === "prologue" || !cur)) {
+          walks.push((cur = { t0: t, t1: t }));
+        }
+        prev = p;
+        if (!cur) continue;
+        if (cur[p] === undefined) cur[p] = t;
+        cur.t1 = Math.max(cur.t1, t + Math.max(1, e.duration || 1) + (e.stall || 0));
+      }
+    }
+    if (!walks.length) return;
+
+    // Split the waves into launches on how far apart they start, measured against how long
+    // one lives. A launch fills the machine at once, so its waves start within a rounding
+    // error of a lifetime of each other, while the next launch cannot begin until the slots
+    // drain. Overlap is no use as a signal: consecutive dispatches do overlap here, one
+    // still finishing on a slot the next has not reached yet.
+    walks.sort((a, b) => a.t0 - b.t0);
+    const cut = 0.25 * median(walks.map((w) => w.t1 - w.t0));
+    const launches = [[walks[0]]];
+    for (let i = 1; i < walks.length; i++) {
+      if (cut > 0 && walks[i].t0 - walks[i - 1].t0 > cut) launches.push([]);
+      launches[launches.length - 1].push(walks[i]);
+    }
+    // A trace of short waves run back to back is a stream, not a series of launches; past a
+    // handful of groups the split says more about the slots than about the dispatches.
+    const grouped = launches.length <= 8 ? launches : [walks];
+
+    const pct = new Map((PHASES.phases || []).map((p) => [p.name, p.pct]));
+    phaseMarks = [];
+    grouped.forEach((group, k) => {
+      for (const name of PHASE_ORDER) {
+        const ts = group.map((w) => w[name]).filter((t) => t !== undefined);
+        if (!ts.length) continue;
+        phaseMarks.push({
+          name,
+          cycle: median(ts),
+          waves: ts.length,
+          pct: pct.get(name) || 0,
+          launch: grouped.length > 1 ? k + 1 : 0,
+        });
+      }
+    });
+    phaseMarks.launches = grouped.length;
+  }
+
+  function drawPhases() {
+    if (!phasesOn || !phaseMarks) return;
+    ctx.save();
+    ctx.font = "11px ui-monospace, monospace";
+    ctx.textBaseline = "top";
+    // Zoomed out, a launch's three entries are a few thousand cycles apart in a span of
+    // hundreds of thousands, so their labels would print on top of each other. Each one
+    // drops to the first row below that is still free at its x.
+    const rows = [];
+    for (const m of phaseMarks) {
+      const x = Math.round(xScale(m.cycle)) + 0.5;
+      if (x < LEFT_PAD || x > cssW) continue;
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, cssH);
+      ctx.stroke();
+
+      // The share is measured over the whole capture, so it only belongs on the label while
+      // there is one launch for it to describe.
+      const label = m.launch ? `L${m.launch} ${m.name}` : `${m.name} ${m.pct.toFixed(1)}%`;
+      const w = ctx.measureText(label).width + 6;
+      // The last phase of the last launch sits at the right edge, where a label placed to the
+      // right of its line falls off the canvas. Flip it to the left rather than clip it.
+      const flip = x + 3 + w > cssW;
+      const lx = flip ? x - 3 - w : x + 3;
+      let r = 0;
+      while (r < rows.length && rows[r] > lx) r++;
+      rows[r] = lx + w + 4;
+      const y = 2 + r * 15;
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(lx, y, w, 15);
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillText(label, lx + 3, y + 2);
+    }
+    ctx.restore();
+  }
+
   function saveMarkers() {
     vscode.postMessage({ type: "saveMarkers", traceKey, value: MARKERS });
   }
@@ -2960,19 +3192,25 @@
     const width = viewport.clientWidth;
     const height = Math.max(viewport.clientHeight, TOP_PAD + lanesTotalH + 30);
     // keep canvas width == viewport to avoid horizontal scroll hiding wave labels
-    canvas.width = Math.max(1, width);
-    canvas.height = height;
+    const dpr = window.devicePixelRatio || 1;
+    cssW = Math.max(1, width);
+    cssH = height;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     requestDraw();
   }
 
   function xScale(cycle) {
-    const w = canvas.width - LEFT_PAD - 10;
+    const w = cssW - LEFT_PAD - 10;
     const t = (cycle - view.min) / (view.max - view.min || 1);
     return LEFT_PAD + t * w;
   }
 
   function cycleAtX(x) {
-    const w = canvas.width - LEFT_PAD - 10;
+    const w = cssW - LEFT_PAD - 10;
     const t = (x - LEFT_PAD) / (w || 1);
     return view.min + t * (view.max - view.min);
   }
@@ -2984,13 +3222,13 @@
     ctx.font = "11px ui-sans-serif, system-ui";
     ctx.textBaseline = "top";
 
-    const w = canvas.width - LEFT_PAD - 10;
+    const w = cssW - LEFT_PAD - 10;
     const steps = Math.floor(w / GRID_STEP_PX);
     for (let i = 0; i <= steps; i++) {
       const x = LEFT_PAD + i * GRID_STEP_PX;
       ctx.beginPath();
       ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
+      ctx.lineTo(x, cssH);
       ctx.stroke();
       const cyc = Math.round(cycleAtX(x));
       ctx.fillText(String(cyc), x + 3, 4);
@@ -3007,7 +3245,7 @@
       const y = Math.round(laneYByLane[i]) + 0.5;
       ctx.beginPath();
       ctx.moveTo(LEFT_PAD - 8, y);
-      ctx.lineTo(canvas.width, y);
+      ctx.lineTo(cssW, y);
       ctx.stroke();
     }
 
@@ -3093,7 +3331,6 @@
     }
   }
 
-  let _drawPending = false;
   function requestDraw() {
     if (!_uiReady) { _drawRequestedBeforeReady = true; return; }
     if (_drawPending) return;
@@ -3125,14 +3362,14 @@
     ctx.save();
     // shaded region + boundary lines
     ctx.fillStyle = "rgba(255,255,255,0.08)";
-    ctx.fillRect(left, 0, width, canvas.height);
+    ctx.fillRect(left, 0, width, cssH);
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(left, 0);
-    ctx.lineTo(left, canvas.height);
+    ctx.lineTo(left, cssH);
     ctx.moveTo(left + width, 0);
-    ctx.lineTo(left + width, canvas.height);
+    ctx.lineTo(left + width, cssH);
     ctx.stroke();
 
     // label
@@ -3145,7 +3382,7 @@
     const tw = ctx.measureText(label).width;
     const bw = tw + padX * 2;
     const bh = 20;
-    const bx = Math.max(LEFT_PAD + 4, Math.min(left + 4, canvas.width - bw - 4));
+    const bx = Math.max(LEFT_PAD + 4, Math.min(left + 4, cssW - bw - 4));
     const by = 4;
     ctx.fillStyle = "rgba(0,0,0,0.60)";
     ctx.strokeStyle = "rgba(255,255,255,0.18)";
@@ -3158,17 +3395,18 @@
   }
 
   function draw() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, cssW, cssH);
     drawGrid();
 
     // Everything below is placed by xScale, whose origin is LEFT_PAD, so panning
     // right slides content into the gutter and paints over the lane labels.
     ctx.save();
     ctx.beginPath();
-    ctx.rect(LEFT_PAD, 0, Math.max(0, canvas.width - LEFT_PAD), canvas.height);
+    ctx.rect(LEFT_PAD, 0, Math.max(0, cssW - LEFT_PAD), cssH);
     ctx.clip();
 
     drawEvents();
+    drawPhases();
     // user markers (draw over events)
     if (MARKERS && MARKERS.length) {
       ctx.save();
@@ -3179,14 +3417,14 @@
         ctx.lineWidth = 5;
         ctx.beginPath();
         ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
+        ctx.lineTo(x, cssH);
         ctx.stroke();
         // main marker
         ctx.strokeStyle = MARKER_COLOR;
         ctx.lineWidth = 3;
         ctx.beginPath();
         ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
+        ctx.lineTo(x, cssH);
         ctx.stroke();
       }
       ctx.restore();
@@ -3331,7 +3569,7 @@
       const cycle = cycleAtX(x);
       const cyc = Math.round(cycle);
       const near = findMarkerNear(x, 6);
-      if (near != null && Math.abs(near - cyc) <= Math.max(2, Math.round((view.max - view.min) / canvas.width) * 3)) {
+      if (near != null && Math.abs(near - cyc) <= Math.max(2, Math.round((view.max - view.min) / cssW) * 3)) {
         MARKERS = MARKERS.filter((v) => v !== near);
       } else {
         if (!MARKERS.includes(cyc)) MARKERS.push(cyc);
@@ -3429,7 +3667,7 @@
     }
     if (!dragging || !view0) return;
     const dx = ev.clientX - dragX0;
-    const w = canvas.width - LEFT_PAD - 10;
+    const w = cssW - LEFT_PAD - 10;
     const frac = dx / (w || 1);
     const span = view0.max - view0.min;
     const shift = -frac * span;

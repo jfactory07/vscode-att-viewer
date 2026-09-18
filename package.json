@@ -2,7 +2,7 @@
   "name": "att-trace-viewer",
   "displayName": "ATT Trace Viewer",
   "description": "View ROCm Advanced Thread Trace (ATT) in a VS Code webview timeline",
-  "version": "0.0.64",
+  "version": "0.0.95",
   "publisher": "jfactory07",
   "license": "MIT",
   "repository": {
@@ -64,6 +64,11 @@
     "configuration": {
       "title": "ATT Viewer",
       "properties": {
+        "attViewer.addToChatSubmit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send the selection as soon as \"Add to chat\" is clicked. Off, it is left in the chat input so you can add your own question before sending."
+        },
         "attViewer.pythonPath": {
           "type": "string",
           "default": "python3",
@@ -93,6 +98,11 @@
           "type": "boolean",
           "default": true,
           "description": "When falling back to the compile-time path, copy the file into ui_output_*/source_*_<basename> so later opens and other machines use the snapshot. Run bench/att_fill_sources.py after capture to batch-fill existing traces."
+        },
+        "attViewer.addToChatAttachAsReference": {
+          "type": "boolean",
+          "default": false,
+          "description": "Try to attach the selection as a collapsed file reference instead of writing the question as text. Needs an undocumented editor command, and opens the selection file in an editor for a moment on every click; falls back to the question as text where the command is missing."
         }
       }
     }

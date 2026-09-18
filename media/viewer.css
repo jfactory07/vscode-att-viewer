@@ -12,6 +12,10 @@ html, body {
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }
+/* The view below the toolbar takes the height that is left, rather than `100%` minus a figure
+   for the toolbar: the toolbar is as tall as its buttons, which is 4px more than the 44px that
+   was assumed here, and the overflow put a second scrollbar beside the analysis view's own. */
+body { display: flex; flex-direction: column; overflow: hidden; }
 .topbar {
   display: flex;
   gap: 12px;
@@ -19,10 +23,11 @@ html, body {
   padding: 10px 12px;
   background: var(--panel);
   border-bottom: 1px solid rgba(255,255,255,0.08);
+  flex: 0 0 auto;
 }
 .topbar .title { font-weight: 600; }
 .topbar .meta { color: var(--muted); font-size: 12px; }
-.main { height: calc(100% - 44px); display: grid; grid-template-rows: 220px 6px 1fr; }
+.main { flex: 1 1 auto; min-height: 0; display: grid; grid-template-rows: 220px 6px 1fr; }
 .divider { background: rgba(255,255,255,0.08); cursor: row-resize; }
 .viewport { position: relative; overflow-y: auto; overflow-x: hidden; }
 .sourcePane { background: #0f1012; overflow: hidden; display: grid; grid-template-rows: 34px 1fr; grid-template-columns: minmax(0, 1fr); }
@@ -241,6 +246,10 @@ html, body {
 .hipStackWrap {
   border-bottom: 1px solid rgba(255,255,255,0.08);
   background: rgba(0,0,0,0.18);
+  /* A grid item will not shrink below its content without this, and an inlined frame names a
+     template instantiation: one `static_unroll<32, (lambda at …)>` is wider than the screen,
+     so the stack grew past the pane and painted over the listing instead of wrapping. */
+  min-width: 0;
 }
 .hipStackHead {
   padding: 3px 8px 0;
@@ -253,6 +262,8 @@ html, body {
 .hipStack {
   max-height: 132px;
   overflow: auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .hipStackNote {
   padding: 4px 8px 6px;
@@ -400,6 +411,12 @@ canvas { display: block; background: #17181b; }
   cursor: pointer;
 }
 .btn:hover { background: rgba(255,255,255,0.10); }
+.btn.active {
+  background: rgba(240,160,32,0.20);
+  border-color: rgba(240,160,32,0.65);
+  color: #fff;
+}
+.btn:disabled { opacity: 0.5; cursor: default; }
 .loading {
   position: absolute;
   left: 12px;

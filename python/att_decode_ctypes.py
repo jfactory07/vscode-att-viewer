@@ -75,6 +75,151 @@ class DecodedInst:
     pc: int
 
 
+@dataclass
+class DecodedWave:
+    """One wave's lifetime and the instructions the decoder stitched to it."""
+
+    cu: int
+    simd: int
+    slot: int
+    begin: int
+    end: int
+    insts: List[DecodedInst]
+
+
+def decode_att_waves(
+    att_path: Path,
+    code_objects: List[Tuple[int, int, int, Path]],
+    decoder_lib_path: Path = Path("/opt/rocm/lib"),
+    rocprofiler_sdk_path: Path = Path("/opt/rocm/lib/librocprofiler-sdk.so"),
+) -> Tuple[int, List[DecodedWave]]:
+    """Decode an ATT trace, keeping each wave's record separate.
+
+    A wave slot (cu, simd, slot) hosts a new wave whenever the previous one retires, so the
+    flat instruction list decode_att returns cannot tell waves apart. Occupancy over time and
+    per-wave statistics need the begin/end times the decoder reports per wave record.
+    """
+    sdk = C.CDLL(str(rocprofiler_sdk_path), mode=C.RTLD_GLOBAL)
+
+    create = sdk.rocprofiler_thread_trace_decoder_create
+    create.argtypes = [C.POINTER(DecoderHandle), C.c_char_p]
+    create.restype = C.c_int
+
+    destroy = sdk.rocprofiler_thread_trace_decoder_destroy
+    destroy.argtypes = [DecoderHandle]
+    destroy.restype = None
+
+    codeobj_load = sdk.rocprofiler_thread_trace_decoder_codeobj_load
+    codeobj_load.argtypes = [
+        DecoderHandle,
+        C.c_uint64,
+        C.c_uint64,
+        C.c_uint64,
+        C.c_void_p,
+        C.c_uint64,
+    ]
+    codeobj_load.restype = C.c_int
+
+    trace_decode = sdk.rocprofiler_trace_decode
+    trace_decode.argtypes = [DecoderHandle, _CB, C.c_void_p, C.c_uint64, C.c_void_p]
+    trace_decode.restype = C.c_int
+
+    info_string = sdk.rocprofiler_thread_trace_decoder_info_string
+    info_string.argtypes = [DecoderHandle, C.c_int]
+    info_string.restype = C.c_char_p
+
+    handle = DecoderHandle()
+    st = create(C.byref(handle), str(decoder_lib_path).encode("utf-8"))
+    if st != ROCPROF_STATUS_SUCCESS:
+        raise RuntimeError(f"decoder_create failed status={st}")
+
+    buffers: List[C.Array] = []
+    for (load_id, load_base, load_size, elf_path) in code_objects:
+        data = elf_path.read_bytes()
+        buf = (C.c_ubyte * len(data)).from_buffer_copy(data)
+        buffers.append(buf)
+        st = codeobj_load(
+            handle,
+            C.c_uint64(load_id),
+            C.c_uint64(load_base),
+            C.c_uint64(load_size),
+            C.cast(buf, C.c_void_p),
+            C.c_uint64(len(data)),
+        )
+        if st != ROCPROF_STATUS_SUCCESS:
+            raise RuntimeError(f"codeobj_load failed id={load_id} status={st}")
+
+    lane_map: Dict[int, int] = {}
+    gfxip_major = 0
+    waves_out: List[DecodedWave] = []
+
+    def get_lane(cu: int, simd: int, slot: int) -> int:
+        key = (cu << 16) | (simd << 8) | slot
+        if key not in lane_map:
+            lane_map[key] = len(lane_map)
+        return lane_map[key]
+
+    @_CB
+    def cb(record_type: int, events_ptr: int, n: int, _user: int) -> None:
+        nonlocal gfxip_major
+        if record_type == RECORD_GFXIP:
+            gfxip_major = int(events_ptr or 0)
+            return
+        if record_type == RECORD_INFO and events_ptr and n:
+            infos = C.cast(events_ptr, C.POINTER(C.c_int))
+            for i in range(int(n)):
+                msg = info_string(handle, int(infos[i]))
+                if msg:
+                    import sys
+
+                    sys.stderr.write("ATT info: " + msg.decode("utf-8", "replace") + "\n")
+            return
+        if record_type != RECORD_WAVE or not events_ptr or not n:
+            return
+        waves = C.cast(events_ptr, C.POINTER(Wave))
+        for wi in range(int(n)):
+            w = waves[wi]
+            cu, simd, slot = int(w.cu), int(w.simd), int(w.wave_id)
+            lane = get_lane(cu, simd, slot)
+            insts: List[DecodedInst] = []
+            arr = w.instructions_array
+            for ii in range(int(w.instructions_size)):
+                inst = arr[ii]
+                insts.append(
+                    DecodedInst(
+                        lane=lane,
+                        cu=cu,
+                        simd=simd,
+                        slot=slot,
+                        issue=int(inst.time),
+                        duration=int(inst.duration),
+                        stall=int(inst.stall),
+                        category=int(inst.category),
+                        marker_id=int(inst.pc.marker_id),
+                        pc=int(inst.pc.addr),
+                    )
+                )
+            waves_out.append(
+                DecodedWave(
+                    cu=cu,
+                    simd=simd,
+                    slot=slot,
+                    begin=int(w.begin_time),
+                    end=int(w.end_time),
+                    insts=insts,
+                )
+            )
+
+    att_bytes = att_path.read_bytes()
+    att_buf = (C.c_ubyte * len(att_bytes)).from_buffer_copy(att_bytes)
+    st = trace_decode(handle, cb, C.cast(att_buf, C.c_void_p), C.c_uint64(len(att_bytes)), None)
+    destroy(handle)
+    if st != ROCPROF_STATUS_SUCCESS:
+        raise RuntimeError(f"trace_decode failed status={st}")
+
+    return gfxip_major, waves_out
+
+
 def decode_att(
     att_path: Path,
     code_objects: List[Tuple[int, int, int, Path]],

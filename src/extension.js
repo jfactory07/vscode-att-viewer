@@ -78,6 +78,319 @@ function indexSourceSnapshot(dir) {
   return byBase;
 }
 
+// Where the MCP server keeps its state, mirroring att_mcp.py's own default.
+let chatCommands = new Set();
+
+function mcpStateDir() {
+  return process.env.ATT_MCP_CACHE || path.join(os.homedir(), ".cache", "att_mcp");
+}
+
+// Record which trace the reader is looking at, for the MCP server's `att_current` to answer.
+//
+// The analysis lives in a chat rather than in this panel now, and a chat has no way to see
+// which of the 200-odd captures on disk the question is about. This is that missing link:
+// the panel writes what it opened, and the server reads it.
+function readCurrentState() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(mcpStateDir(), "current.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeCurrentState(state) {
+  try {
+    const dir = mcpStateDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "current.json"), JSON.stringify(state), "utf8");
+    return true;
+  } catch {
+    return false; /* the panel still works without the handoff */
+  }
+}
+
+function recordCurrentTrace(attPath) {
+  const prev = readCurrentState();
+  const state = {
+    att: attPath,
+    dir: path.dirname(attPath),
+    name: path.basename(attPath),
+    updated: Math.floor(Date.now() / 1000),
+  };
+  // A selection is only meaningful for the trace it was made in, so carry it across a
+  // refocus of the same trace but drop it when the reader switches to a different one.
+  if (prev && prev.att === attPath && prev.selection) state.selection = prev.selection;
+  writeCurrentState(state);
+}
+
+// Attach the instructions highlighted in the listing to the trace's chat context.
+//
+// Selecting a range in the panel is how a reader points at code; this makes that gesture
+// legible to the chat, which otherwise only knows the trace as a whole.
+function recordSelection(attPath, msg) {
+  const lines = Array.isArray(msg.lines) ? msg.lines.slice(0, 400) : [];
+  const state = readCurrentState() || {};
+  state.att = attPath;
+  state.dir = path.dirname(attPath);
+  state.name = path.basename(attPath);
+  state.updated = Math.floor(Date.now() / 1000);
+  state.selection = {
+    codeobj: msg.codeobjPath || "",
+    marker: msg.markerId == null ? null : msg.markerId,
+    begin: msg.begin,
+    end: msg.end,
+    count: Array.isArray(msg.lines) ? msg.lines.length : 0,
+    truncated: Array.isArray(msg.lines) && msg.lines.length > lines.length,
+    lines,
+    attached: Math.floor(Date.now() / 1000),
+  };
+  return writeCurrentState(state);
+}
+
+// Where the selection files go, beside the rest of the MCP server's state.
+//
+// Not under the workspace: a chip for a file outside it sends as readily as one inside, and
+// the reader's source tree is no place for a file written on every click.
+function selectionsDir() {
+  return path.join(mcpStateDir(), "selections");
+}
+
+// Write the selected instructions somewhere Cursor can reference as a file range. That is
+// what makes the chat show them as one collapsed chip instead of a wall of text: its own
+// "add to chat" attaches a range, and a range needs a file behind it.
+//
+// The header says which trace this came from and what to call for the cycles. The chip is the
+// whole file, so everything in it arrives with the selection, which is what keeps that out of
+// the chat input.
+function writeSelectionFile(attPath, msg) {
+  const hex = (v) => "0x" + Number(v).toString(16);
+  const dir = selectionsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const lines = Array.isArray(msg.lines) ? msg.lines : [];
+  const w = Math.max(...lines.map((x) => hex(x.addr).length), 0);
+  const head = [
+    `; ${lines.length} instructions selected in the ATT trace ${path.basename(attPath)}, ` +
+      `${hex(msg.begin)}\u2013${hex(msg.end)}.`,
+    ";",
+    "; Call att_current for the trace and this selection, then att_disasm with",
+    `; begin=${hex(msg.begin)} end=${hex(msg.end)} for the stall cycles measured against`,
+    "; each of these instructions.",
+    "",
+    "",
+  ];
+  const body = lines
+    .map((x) => `${hex(x.addr).padEnd(w)}  ${x.text}`)
+    .join("\n");
+  const file = path.join(
+    dir,
+    `${path.basename(attPath, ".att")}_${hex(msg.begin)}-${hex(msg.end)}.s`
+  );
+  fs.writeFileSync(file, head.join("\n") + body + "\n", "utf8");
+  return file;
+}
+
+// What goes into the chat input when the selection is attached: the question, nothing else.
+//
+// Everything else is in the attached file, which is the point of attaching it.
+function attachedQuestion(msg) {
+  const n = Array.isArray(msg.lines) ? msg.lines.length : 0;
+  return `What is costing time in these ${n} attached instructions?`;
+}
+
+// The selection file as Cursor's chat states a path: relative to the workspace when it is
+// inside it, and carrying the line range, which is what the chat collapses into a chip.
+function mentionOf(file) {
+  const folders = vscode.workspace.workspaceFolders;
+  const root = folders && folders.length ? folders[0].uri.fsPath : "";
+  const shown = root && file.startsWith(root + path.sep) ? path.relative(root, file) : file;
+  const lines = fs.readFileSync(file, "utf8").split("\n").length - 1;
+  return `@${shown}:1-${lines}`;
+}
+
+// What goes into the chat input when it is all that is going: a mention of the selection file,
+// and the question.
+//
+// Not the instructions themselves, and not what to call either. Pasting the listing was how
+// this started and it is both ugly and redundant, and the rest — which trace this came from,
+// and that `att_current` and `att_disasm` hold the cycles measured against each instruction —
+// is in the file's own header, where it arrives with the mention.
+function selectionQuestion(msg, file) {
+  const n = Array.isArray(msg.lines) ? msg.lines.length : 0;
+  return `${mentionOf(file)} What is costing time in these ${n} instructions?`;
+}
+
+// Ways to get a selection into the chat as a reference rather than as pasted text, tried in
+// turn until one is accepted. When every attempt throws the caller falls back to writing the
+// question as text.
+//
+// None of the ids is API and none of the commands reports what it did, so a throw is the only
+// failure that can be detected here — a chip that draws is not proof the chat can be sent.
+const ATTACH_ATTEMPTS = [
+  // What Ctrl+L runs, called with nothing: Cursor states the focused editor's selection as a
+  // mention in the chat input, which is the only reference seen to survive being sent.
+  //
+  // The payload cannot be built here instead. `composer.addsymbolstocomposer` takes a
+  // `codeSelections` payload and draws the chip, and then the chat fails to serialize on send
+  // — the same for Monaco's IRange as for a `vscode.Range`, for the file inside the workspace
+  // as outside it, and for the tab left open behind the chip as closed. Nor can the keybinding
+  // be reached by its own command id: `editor.action.addSymbolToChat` is accepted from an
+  // extension and does nothing.
+  {
+    cmd: "aichat.newchataction",
+    what: "no arguments, off the focused editor",
+    args: () => [],
+  },
+];
+
+// Append what "Add to chat" did. None of the commands it drives report success, and the
+// panel's only other account of itself is a toast that has faded by the time anyone asks
+// why the chat looks wrong, which leaves nothing to read afterwards.
+function chatLog(line) {
+  try {
+    fs.mkdirSync(mcpStateDir(), { recursive: true });
+    fs.appendFileSync(
+      path.join(mcpStateDir(), "add-to-chat.log"),
+      `${new Date().toISOString()}  ${line}\n`,
+      "utf8"
+    );
+  } catch { /* a missing log is not worth failing the attach for */ }
+}
+
+// Close every selection file this has opened, wherever in the window they ended up.
+//
+// Not `closeActiveEditor`: the attach command takes focus into the chat, so by then the active
+// tab can be the trace panel this was clicked from, which is what closing it would take out.
+async function closeSelectionTabs() {
+  const dir = selectionsDir();
+  const tabs = vscode.window.tabGroups.all
+    .flatMap((g) => g.tabs)
+    .filter((t) => {
+      const uri = t.input && t.input.uri;
+      return uri && path.dirname(uri.fsPath) === dir;
+    });
+  if (tabs.length) await vscode.window.tabGroups.close(tabs, true);
+}
+
+// Try to hand the selection over as a file range, the way Cursor's own "add to chat" does,
+// so the chat shows one collapsed chip.
+//
+// Off by default, because it cannot be done quietly. A command can only act on the focused
+// editor's selection, so the selection file is opened, selected and closed again on every
+// click — a tab flashing past each time — and the command that takes it from there is not API.
+async function attachSelectionAsRange(attPath, msg) {
+  if (!vscode.workspace.getConfiguration("attViewer").get("addToChatAttachAsReference")) {
+    return null;
+  }
+  const tries = ATTACH_ATTEMPTS.filter((a) => chatCommands.has(a.cmd));
+  chatLog(`attach: ${tries.length} command(s) available [${tries.map((a) => a.cmd)}]`);
+  if (tries.length === 0) return null;
+
+  const file = writeSelectionFile(attPath, msg);
+  const took = [];
+  try {
+    const doc = await vscode.workspace.openTextDocument(file);
+    const ed = await vscode.window.showTextDocument(doc, { preview: true });
+    // The whole file, to the end of the last line: Cursor reads the range off this selection
+    // now, so stopping at the start of the last line would drop an instruction from the chip.
+    const end = doc.lineAt(Math.max(0, doc.lineCount - 1)).range.end;
+    const sel = new vscode.Selection(0, 0, end.line, end.character);
+    ed.selection = sel;
+    chatLog(`attach: ${file} open, ${doc.lineCount} lines selected`);
+    for (const a of tries) {
+      try {
+        await vscode.commands.executeCommand(a.cmd, ...a.args(doc, sel));
+        took.push(`${a.cmd} (${a.what})`);
+        chatLog(`attach: ${a.cmd} accepted ${a.what}`);
+        break;
+      } catch (e) {
+        chatLog(`attach: ${a.cmd} rejected ${a.what} — ${e && e.message}`);
+      }
+    }
+    // Cursor builds the reference asynchronously off the focused editor, so the attach is not
+    // finished when the command returns.
+    await new Promise((r) => setTimeout(r, 400));
+    await closeSelectionTabs();
+  } catch (e) {
+    chatLog(`attach: could not open the selection file — ${e && e.message}`);
+    return null;
+  }
+  // Nothing took it: let the caller write the question as text rather than leave the click
+  // with nothing but a clipboard.
+  if (took.length === 0) {
+    chatLog("attach: every command rejected the selection");
+    return null;
+  }
+
+  // "Accepted" is as far as this can be put: no command here says whether a chip appeared.
+  const via = `handed to ${took.join(" and ")}`;
+  await vscode.env.clipboard.writeText(attachedQuestion(msg));
+  // Focus is left wherever the attach command put it, which is the chat holding the mention it
+  // just wrote. Reaching for the composer again would be reaching for whichever chat was
+  // focused before, and the question would be asked of the wrong conversation.
+  await new Promise((r) => setTimeout(r, 300));
+  const editor = vscode.window.activeTextEditor;
+  if (editor) {
+    const name = path.basename(editor.document.fileName);
+    return { how: `${via} — question on the clipboard, ${name} is the active editor` };
+  }
+  try {
+    await vscode.commands.executeCommand("editor.action.clipboardPasteAction");
+    return { how: `${via}, with the question` };
+  } catch {
+    return { how: `${via} — question on the clipboard` };
+  }
+}
+
+// Hand a prompt to the chat.
+//
+// Cursor exposes no supported API for this and which commands exist varies by build, so try
+// the ones this build actually registered, in order of how little they disturb: prefilling the
+// chat input leaves the user's conversation intact, opening a new chat does not. The clipboard
+// is written first so there is always something to paste if every command turns out to be a
+// no-op. Returns what it used, or "" if nothing took the text.
+async function sendPromptToChat(prompt) {
+  await vscode.env.clipboard.writeText(prompt);
+  chatLog(`fallback: pasting ${prompt.split("\n").length} lines of prompt as text`);
+
+  // Focus-and-paste before the chat command: Cursor's `workbench.action.chat.open` starts a
+  // new chat rather than revealing the last-focused one as upstream does, which loses the
+  // conversation the selection was meant to continue. Pasting lands wherever the focus went,
+  // so it is only attempted while no text editor can catch it.
+  //
+  // Neither command reports whether it did anything, so what this returns is the path taken,
+  // not proof it landed. The clipboard is written first and the caller says so, because the
+  // one thing that must not happen is the panel claiming success into a void.
+  const editor = vscode.window.activeTextEditor;
+  if (editor) {
+    // Bailing out is the safe move: a paste routed to the editor would edit the user's file.
+    return { how: "", why: `${path.basename(editor.document.fileName)} is the active editor` };
+  }
+  if (chatCommands.has("composer.focusComposer")) {
+    try {
+      await vscode.commands.executeCommand("composer.focusComposer");
+      // Long enough for a collapsed chat panel to open and take focus before the paste.
+      await new Promise((r) => setTimeout(r, 300));
+      await vscode.commands.executeCommand("editor.action.clipboardPasteAction");
+      return { how: "pasted into the open chat" };
+    } catch (e) {
+      return { how: "", why: `paste failed: ${e && e.message}` };
+    }
+  }
+  if (chatCommands.has("workbench.action.chat.open")) {
+    const submit = !!vscode.workspace.getConfiguration("attViewer").get("addToChatSubmit");
+    try {
+      await vscode.commands.executeCommand("workbench.action.chat.open", {
+        query: prompt,
+        isPartialQuery: !submit,
+      });
+      return { how: submit ? "sent to a new chat" : "filled a new chat's input" };
+    } catch (e) {
+      return { how: "", why: `chat.open failed: ${e && e.message}` };
+    }
+  }
+  return { how: "", why: "this build exposes no chat command" };
+}
+
 async function promptForFile(cfg, settingKey, notFoundMsg, openLabel) {
   const choice = await vscode.window.showErrorMessage(notFoundMsg, "Browse…", "Cancel");
   if (choice !== "Browse…") return null;
@@ -136,6 +449,7 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
       <div class="title">ATT Timeline</div>
       <div class="meta" id="meta"></div>
       <div class="legend" id="legend"></div>
+      <button class="btn" id="phasesBtn" title="Mark prologue / mainline / epilogue on the timeline, cut at the hot loop the trace spun in">Phases</button>
       <button class="btn" id="colorsBtn" title="Edit colors">Colors</button>
       <div class="hint">wheel=zoom, drag=pan, alt+click=marker</div>
     </div>
@@ -189,6 +503,32 @@ function activate(context) {
     context.globalState.update("attViewer.colors", undefined);
     context.globalState.update("attViewer.paletteRev", PALETTE_REV);
   }
+
+  vscode.commands.getCommands(true).then(
+    (all) => {
+      chatCommands = new Set(all);
+      // None of the chat commands report whether they did anything, so which ones this
+      // build exposes is the only evidence of why "Add to chat" took the path it took.
+      try {
+        fs.mkdirSync(mcpStateDir(), { recursive: true });
+        fs.writeFileSync(
+          path.join(mcpStateDir(), "chat-commands.json"),
+          JSON.stringify(
+            {
+              app: vscode.env.appName,
+              version: vscode.version,
+              attach: ATTACH_ATTEMPTS.map((a) => a.cmd).filter((c) => chatCommands.has(c)),
+              related: all.filter((c) => /chat|composer|aichat/i.test(c)).sort(),
+            },
+            null,
+            1
+          ) + "\n",
+          "utf8"
+        );
+      } catch { /* diagnostics are never worth failing activation for */ }
+    },
+    () => {}
+  );
 
   const openAtt = vscode.commands.registerCommand("attViewer.openAtt", async () => {
     const lastDir = context.globalState.get("attViewer.lastDir", null);
@@ -386,6 +726,12 @@ async function openAttImpl(context, attUri, existingPanel = null) {
   const traceKey = sha1(attPath);
   panel.webview.html = getWebviewHtml(panel.webview, context, jsonUri, traceKey);
 
+  // Follow the focused panel, so switching between two traces moves the chat's context with it.
+  recordCurrentTrace(attPath);
+  panel.onDidChangeViewState((e) => {
+    if (e.webviewPanel.active) recordCurrentTrace(attPath);
+  });
+
   // In-panel disassembly cache
   const disasmCache = new Map();
   const inlineStackCache = new Map(); // `${codeobj}|${addr}` -> stack[]
@@ -448,6 +794,33 @@ async function openAttImpl(context, attUri, existingPanel = null) {
     } else if (msg.type === "copyText") {
       // fallback path: the webview could not reach the browser clipboard itself
       await vscode.env.clipboard.writeText(String(msg.text || ""));
+      if (msg.toast) vscode.window.showInformationMessage(`ATT Viewer: ${msg.toast}.`);
+    } else if (msg.type === "requestPhases") {
+      try {
+        panel.webview.postMessage({ type: "phases", phases: await loadPhases(context, attPath) });
+      } catch (e) {
+        panel.webview.postMessage({ type: "phases", error: e.message });
+      }
+    } else if (msg.type === "attachSelection") {
+      const n = Array.isArray(msg.lines) ? msg.lines.length : 0;
+      // Recorded either way: the state file is what att_current reads, and it carries the
+      // whole selection where the prompt only carries the first lines of it.
+      if (!recordSelection(attPath, msg)) {
+        vscode.window.showErrorMessage("ATT Viewer: could not write the chat context file.");
+        return;
+      }
+      chatLog(`--- add to chat: ${n} instructions from ${path.basename(attPath)}`);
+      const r =
+        (await attachSelectionAsRange(attPath, msg)) ||
+        (await sendPromptToChat(selectionQuestion(msg, writeSelectionFile(attPath, msg))));
+      chatLog(`result: ${r.how || `nothing — ${r.why}`}`);
+      const said = r.how
+        ? `${n} instruction${n === 1 ? "" : "s"} ${r.how}`
+        : `${n} instruction${n === 1 ? "" : "s"} copied — paste into chat (${r.why})`;
+      panel.webview.postMessage({ type: "selectionAttached", count: n, toast: said });
+      // The effect of this button is in the chat, not in the panel, so a toast in the corner
+      // of the panel is in the wrong place to be read: say it where the window says things.
+      vscode.window.showInformationMessage(`ATT Viewer: ${said}`);
     } else if (msg.type === "requestDisasm") {
       const codeobjPath = msg.codeobjPath;
       if (!codeobjPath) return;
@@ -721,6 +1094,30 @@ function runObjdump(objdump, codeobjPath) {
         lines.push(row);
       }
       resolve(lines);
+    });
+  });
+}
+
+// Ask the MCP server's analysis where the hot loop starts and ends, so the timeline can
+// show the same prologue/mainline/epilogue split the chat tools describe. Runs the analyzer
+// on a cache miss, which is why this is only called when the overlay is switched on.
+function loadPhases(context, attPath) {
+  const py = vscode.workspace.getConfiguration("attViewer").get("pythonPath", "python3");
+  const script = path.join(context.extensionUri.fsPath, "python", "att_mcp.py");
+  return new Promise((resolve, reject) => {
+    const p = spawn(py, [script, "--phases", path.dirname(attPath)], { env: process.env });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("error", (e) => reject(e));
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error(err.trim().split("\n").pop() || `exit ${code}`));
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        reject(new Error("could not read the analyzer's output"));
+      }
     });
   });
 }

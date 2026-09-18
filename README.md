@@ -14,6 +14,8 @@ Interactive timeline viewer for ROCm Advanced Thread Trace (ATT) inside VS Code,
 - Occurrences pane:
   - Lane filter dropdown
   - Δt0 column (delta vs previous occurrence)
+- Bottleneck analysis as MCP tools: whole-dispatch cycle accounting, stall reasons, hot source
+  lines, and static checks on the machine code priced by the trace
 - Navigation:
   - Mouse wheel zoom
   - Drag to pan
@@ -50,6 +52,63 @@ The extension will:
 2. Use `results.db` tables `rocpd_info_code_object_*` to locate `*_code_object_id_*.out` files
 3. Run the bundled `python/att2json.py` to decode the trace to JSON (cached under VS Code `globalStorage`)
 4. Open a Webview panel to render the timeline
+
+## Bottleneck analysis
+
+The timeline answers what a wave did at cycle N. The analysis answers where the dispatch spent
+its cycles. It is not a view in the panel: it is `python/att_mcp.py`, an MCP server, so the
+consumer is a chat model that asks one question at a time rather than a reader paging through
+tabs. A model that can pull the disassembly around one address, or a second dispatch to compare
+against, does more with this data than any fixed layout does.
+
+It sums **every shader engine's trace for the same dispatch** — one engine's 16 waves is a thin
+sample to draw conclusions from — and charges each stall to the reason behind it rather than to
+the decoder's instruction category. ATT records a wave's stall cycles against the instruction it
+was about to issue, so the mnemonic is the reason: an `s_waitcnt vmcnt(0)` holding 400 cycles is
+global-memory latency, the same 400 cycles on a `ds_read` is LDS issue pressure, and an
+`s_barrier` is one wave in the workgroup arriving late.
+
+| Tool | What it answers |
+| --- | --- |
+| `att_current` | The trace the panel has open, and the instructions selected in it |
+| `att_summary` | Kernel footprint, occupancy and what bounds it, cycle budget, stall cycles per reason, hot loop |
+| `att_phases` | Prologue, mainline and epilogue split at the hot loop, with the cycles each costs |
+| `att_issues` | Ranked findings — static checks on the machine code, plus what the trace alone says |
+| `att_issue` | One finding in full: why it fires, what it cost, every instruction site backing it |
+| `att_disasm` | Annotated disassembly for an address range: per-instruction hits, stall, exec, source line |
+| `att_hot` | The hottest source lines or instructions, ranked by stall cycles |
+| `att_source` | Source around a line, read from the copy rocprofv3 saved at capture time |
+
+The static checks pair a code pattern with the cycles the trace charged to it, and stay quiet
+when they cannot measure one: occupancy and which of VGPRs or LDS bounds it, register spills,
+`vmcnt(0)`-then-barrier drains, how far each wait sits from the load it blocks on, and how long
+the matrix pipe runs without a memory instruction beside it.
+
+Point an MCP client at it — no dependencies beyond the Python the analysis already needs:
+
+```json
+{
+  "mcpServers": {
+    "att-analysis": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["<extension>/python/att_mcp.py"]
+    }
+  }
+}
+```
+
+It indexes every capture under `/mnt/att_output` and `/tmp/att_pe` (override with
+`ATT_MCP_ROOTS`), so it is not tied to whichever trace the panel has open — but it can follow
+it. The panel records the trace it opens, and `Add to chat` in the disassembly toolbar attaches
+the selected instructions to that record, so `att_current` resolves "this trace" and "these
+instructions" to the panel on screen without the run being named. Indexing only stats
+directories; a run's report is built on first query (~2s) and cached against the trace's mtime
+under `ATT_MCP_CACHE`. The rest of the tools take a run and answer one question each:
+`att_summary`, `att_phases`, `att_issues`, `att_issue`, `att_disasm`, `att_hot`, and `att_source`, which
+reads the copy rocprofv3 saved at capture time rather than the working tree, whose line
+numbers have drifted. A run can also be named directly — as an id, a capture directory or an
+`.att` path — and `python3 att_mcp.py --list` prints the ids on disk.
 
 ## Requirements
 
