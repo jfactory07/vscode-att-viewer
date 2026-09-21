@@ -4,6 +4,24 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- "Add to chat" attaches from the output view and from nowhere else. The two paths kept behind
+  it are gone: `editor.action.clipboardPasteAction` is a Monaco command and the chat input is
+  not a Monaco editor, so the paste resolved without throwing and without pasting, and the
+  panel reported a success it had not observed. With the fallbacks went
+  `attViewer.addToChatViaOutput`, `attViewer.addToChatAttachAsReference` and
+  `attViewer.addToChatSubmit` — the output path is not a setting any more, it is the path
+- The channel is rebuilt on each attach rather than cleared, and the selection is handed over
+  only once the output document is seen to hold the listing. `clear()` and `append()` land out
+  of order, so the first click attached an empty view and the second one the click before it;
+  where the attach cannot be made the toast says so and points at `att_current`, which reaches
+  the same selection whatever the button did
+- The attached listing names every analysis tool rather than `att_current` and `att_disasm`
+  alone: `att_summary`, `att_phases`, `att_issues`, `att_issue`, `att_hot` and `att_source`,
+  each with what it answers. The header is the only place the model is told the rest exist
+- `att_current` resolves the dispatch the panel has open. A capture directory holds many
+  dispatches under one directory, and `resolve` fell through to the directory before trying
+  the `.att` file that names the dispatch, so it returned whichever came first — on a capture
+  of 32 it read #129 while the panel showed #369
 - `attViewer.addToChatViaOutput` attaches the selection from an output view, and nothing opens
   in the editor area. An output view is a code editor like any other, only it lives in the
   panel, so the selection can be made in it and handed to the same command — where opening the
