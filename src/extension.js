@@ -159,6 +159,12 @@ function selectionsDir() {
 //
 // The header says which trace this came from and what to call for the cycles. Whatever this
 // returns arrives with the selection, which is what keeps all of it out of the chat input.
+//
+// It names the whole tool set, not just the two calls that answer the obvious question. A
+// model that has the listing in front of it and knows only `att_disasm` will price these
+// instructions and stop there, when what the reader wants next is nearly always whether the
+// loop is even where the dispatch spends itself. The list costs a dozen lines once per click
+// and is the only place the model is told the other tools exist.
 function selectionListing(attPath, msg) {
   const hex = (v) => "0x" + Number(v).toString(16);
   const lines = Array.isArray(msg.lines) ? msg.lines : [];
@@ -170,6 +176,15 @@ function selectionListing(attPath, msg) {
     "; Call att_current for the trace and this selection, then att_disasm with",
     `; begin=${hex(msg.begin)} end=${hex(msg.end)} for the stall cycles measured against`,
     "; each of these instructions.",
+    ";",
+    "; The rest of the analysis, each taking the run att_current names:",
+    ";",
+    ";   att_summary  footprint, occupancy and what bounds it, cycle budget, stall by reason",
+    ";   att_phases   prologue / mainline / epilogue, cut at the hot loop, cycles for each",
+    ";   att_issues   the ranked findings, with what each one costs",
+    ";   att_issue    one finding in full: why it fires and every site behind it",
+    ";   att_hot      the hottest source lines or instructions, ranked by stall cycles",
+    ";   att_source   the source as the capture saved it, whose line numbers still match",
     "",
     "",
   ];
