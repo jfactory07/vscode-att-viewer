@@ -144,6 +144,13 @@ def resolve(runs: Dict[str, Run], ref: str) -> Run:
     if ref in runs:
         return runs[ref]
     p = Path(ref)
+    # A capture directory can hold many dispatches, so a named .att picks the run holding it.
+    # Falling straight back to the parent directory returns whichever dispatch is first, which
+    # is how the viewer's own trace used to resolve to a different one.
+    if p.suffix == ".att":
+        for r in runs.values():
+            if p in r.atts:
+                return r
     target = p.parent if p.suffix == ".att" else p
     for r in runs.values():
         if r.dir == target:
@@ -254,7 +261,8 @@ def t_current(runs: Dict[str, Run], **_) -> str:
                 "current trace. Ask the user to open one in the viewer, or to name it.")
     try:
         d = json.loads(state.read_text())
-        r = resolve(runs, d.get("dir") or d.get("att") or "")
+        # The .att first: it names the dispatch, and the directory alone does not.
+        r = resolve(runs, d.get("att") or d.get("dir") or "")
     except (json.JSONDecodeError, OSError, ValueError) as e:
         return f"could not read the viewer's current trace: {e}"
 
