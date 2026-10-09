@@ -137,7 +137,12 @@ Timeline:
 - Drag: pan
 - WASD: pan/zoom (Perfetto-like)
 - Shift + WASD: faster pan/zoom
-- Ctrl + left-drag: measure cycle interval (shows Δcycles)
+- Ctrl + left-drag: measure a cycle interval (shows Δcycles)
+- Shift + left-drag: measure the same interval on the row the drag starts on, so it names a
+  slot as well as the cycles. `Add to chat` appears beside it and attaches the instructions
+  that slot ran in them, with the interval and the latency it covers. The listing follows the
+  window: the rows spanning it are selected, the addresses the slot actually ran are marked
+  within that span, and the first of them is scrolled to
 - Alt + click: add/remove a vertical cycle marker
 - Hover or click a bar: the instruction on the sub-row under the pointer, when execution windows
   overlap (see [Overlapping execution windows](#overlapping-execution-windows))

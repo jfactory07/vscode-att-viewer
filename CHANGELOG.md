@@ -4,6 +4,39 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- A shift+drag on the timeline names a slot as well as an interval, and the `Add to chat`
+  button that appears beside it attaches what that slot ran in those cycles. The measurement
+  was a pair of cycle numbers and nothing else, so a reader who had just measured 757 cycles
+  of one wave slot went to the listing to find the instructions behind them by hand — the one
+  question the panel can answer and the reader cannot. The drag already starts on a row, so
+  the row is the slot: the shaded window covers that row and no other, since the rows it says
+  nothing about would be claiming cycles they were not measured for, and the label names the
+  slot next to the delta. Ctrl+drag is left as it was, spanning every row and measuring the
+  interval and nothing else;
+  the two write the same region, so the later drag replaces the earlier one. An instruction
+  is in the window when its span touches it rather than when
+  it issues inside it, since the wave stalled across the whole measurement issued before the
+  measurement began and is the one holding the cycles being asked about. What is attached is
+  one line per address, in address order, not the execution sequence: a loop revisiting an
+  address a hundred times would bury the body it iterates under its own repeats. The cycles
+  are what the sequence would have carried, and they are in the header instead, as the
+  interval and the latency it covers
+- The listing follows a shift+drag. Measuring a stretch of one slot's work and then hunting
+  for the instructions behind it by hand was the gap the window was meant to close, and it was
+  still open in the pane next to it. Two marks land there, because one cannot do both jobs: the
+  rows spanning the window are selected, which is what `Copy` and the listing's own `Add to
+  chat` act on and is necessarily contiguous, and the addresses the slot actually ran are
+  tinted inside that span — a loop holding 757 cycles touches a handful of addresses scattered
+  through a body whose branches it never took, and a plain range would claim all of them. The
+  first marked line is scrolled to, the pane switches to the listing to show it, and a window
+  from another code object disassembles it first and marks it when it arrives. Selecting lines
+  by hand afterwards drops the marks: a hand-made selection is a new subject, and leaving them
+  underneath it would explain nothing
+- `att_current` renders a measured window as one. The executions column belongs to lines
+  picked out of the listing, which are a piece of the program; an interval on one row is a
+  piece of time, and how often an address was reached over the whole dispatch says nothing
+  about the 757 cycles in front of the reader. It is dropped there, and the heading leads with
+  the latency and the slot rather than with a count of instructions
 - "Add to chat" attaches from the output view and from nowhere else. The two paths kept behind
   it are gone: `editor.action.clipboardPasteAction` is a Monaco command and the chat input is
   not a Monaco editor, so the paste resolved without throwing and without pasting, and the

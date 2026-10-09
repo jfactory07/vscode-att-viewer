@@ -464,6 +464,12 @@
   // rebuilt from `disasmLines` rather than scraped from the DOM.
   let disRange = null; // { a:number, b:number } inclusive, unordered
   let disRangeVersion = 0;
+  // The addresses a timeline shift+drag covers, marked in the listing under that row range.
+  // pendingWinSel holds them while the code object they belong to is still being disassembled.
+  let winSelPcs = null; // Set<number> | null
+  let winSelMarker = null;
+  let winSelVersion = 0;
+  let pendingWinSel = null; // { markerId, pcs }
   // disasm search. Only the matching line indices are kept; the per-line match ranges are
   // recomputed for the few visible rows, so a query that hits most of a large listing stays
   // cheap. `cur` indexes into `lines`. The listing covers the whole code object, most of which
@@ -1694,7 +1700,11 @@
     return { lo, hi };
   }
 
-  function setDisRange(a, b) {
+  // keepWindow is for the timeline's own sync, which sets the range and the marks together.
+  // Every other caller is the reader selecting lines by hand, and a hand-made selection is a
+  // new subject: the marks from a timeline window would otherwise sit under it unexplained.
+  function setDisRange(a, b, keepWindow) {
+    if (!keepWindow && winSelPcs) setWindowSel(null, null);
     if (a == null) {
       if (!disRange) return;
       disRange = null;
@@ -1706,6 +1716,44 @@
     disRangeVersion++;
     updateCopyBtn();
     if (srcBody && srcBody._updateDis) srcBody._updateDis();
+  }
+
+  // The addresses a timeline window covers, tinted over the row range that spans them.
+  //
+  // Both are needed and neither replaces the other: the range is what Copy and the listing's
+  // own Add to chat act on, and it is contiguous, while a slot running a loop for 757 cycles
+  // touches a handful of addresses scattered through it. The range says where in the listing
+  // to look, the marks say which lines were actually under the measurement.
+  function setWindowSel(markerId, pcs) {
+    winSelPcs = pcs && pcs.size ? pcs : null;
+    winSelMarker = winSelPcs ? markerId : null;
+    winSelVersion++;
+    if (srcBody && srcBody._updateDis) srcBody._updateDis();
+  }
+
+  // Put the measured window into the listing: the row range that spans it selected, the
+  // addresses it ran marked, and the first of them scrolled into view.
+  function applyWindowSel(markerId, pcs) {
+    const map = srcBody && srcBody._pcToLine;
+    if (!map) {
+      pendingWinSel = { markerId, pcs };
+      return;
+    }
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const pc of pcs) {
+      const idx = map.get(Number(pc));
+      if (idx == null) continue;
+      if (idx < lo) lo = idx;
+      if (idx > hi) hi = idx;
+    }
+    if (!Number.isFinite(lo)) return;
+    setDisRange(lo, hi, true);
+    setWindowSel(markerId, pcs);
+    if (srcBody._disRowH) {
+      srcBody.scrollTop = Math.max(0, lo * srcBody._disRowH - srcBody.clientHeight * 0.35);
+      if (srcBody._updateDis) srcBody._updateDis();
+    }
   }
 
   function selectAllDisasm() {
@@ -2528,6 +2576,7 @@
     let lastSearchVer = -1;
     let lastSelKey = null;
     let lastHipVer = -1;
+    let lastWinVer = -1;
 
     function ensurePool(n) {
       while (pool.length < n) {
@@ -2563,10 +2612,11 @@
       if (first === lastFirst && count === lastCount && lastRegVer === regSelVersion
         && lastWaitVer === waitSelVersion && lastRangeVer === disRangeVersion
         && lastSearchVer === disSearchVersion && lastSelKey === selKey
-        && lastHipVer === hipSelVersion) return;
+        && lastHipVer === hipSelVersion && lastWinVer === winSelVersion) return;
       lastFirst = first; lastCount = count;
       lastSelKey = selKey;
       lastHipVer = hipSelVersion;
+      lastWinVer = winSelVersion;
       lastRegVer = regSelVersion;
       lastWaitVer = waitSelVersion;
       lastRangeVer = disRangeVersion;
@@ -2595,6 +2645,10 @@
 
         row.classList.toggle("selected", selected && selected.marker_id === currentMarkerId && selected.pc === pc);
         row.classList.toggle("rangeSel", !!range && idx >= range.lo && idx <= range.hi);
+        row.classList.toggle(
+          "winSel",
+          !!winSelPcs && String(winSelMarker) === String(currentMarkerId) && winSelPcs.has(pc)
+        );
         row.classList.toggle("lineSel", !!hipSel && ln.file === hipSel.file && ln.line === hipSel.line);
         const searchHits = searchM && disSearchSet.has(idx) ? disSearchHits(searchM, idx) : null;
         row.classList.toggle("searchHit", !!searchHits);
@@ -2941,6 +2995,13 @@
       renderDisasm(msg.lines);
       updateWaitSelFromSelected();
       if (selected && selected.marker_id === msg.markerId) highlightDisasm(selected.pc);
+      // After the selected instruction, not before: both scroll the listing, and the window
+      // is the more recent gesture of the two.
+      if (pendingWinSel && String(pendingWinSel.markerId) === String(msg.markerId)) {
+        const p = pendingWinSel;
+        pendingWinSel = null;
+        applyWindowSel(p.markerId, p.pcs);
+      }
     } else if (msg.type === "disasmError") {
       const p = msg.codeobjPath || currentCodeobjPath;
       setSrcMeta(`Source: ${baseName(p) || "?"} failed (${msg.error || "error"})`, p);
@@ -3344,9 +3405,127 @@
 
   // ---- measure range (left-drag) ----
   // State is defined here so both draw() and event handlers can access it.
-  // Left mouse drag: measure cycle interval (shaded selection + delta label).
+  // Ctrl + left drag: measure a cycle interval (shaded selection + delta label).
+  // Shift + left drag: the same interval, but on the row the drag started on, which makes it
+  // a stretch of one wave slot's work rather than a bare pair of cycle numbers — that is what
+  // can be handed to the chat, so only this one grows the button. Both write the same state,
+  // so the later drag replaces the earlier region.
   // Right mouse drag: pan (see handlers below).
-  let measure = null; // { active:boolean, start:number, end:number, justFinished:boolean }
+  let measure = null; // { active, start, end, forChat:boolean, lane:number, justFinished }
+
+  const measureChatBtn = document.createElement("button");
+  measureChatBtn.className = "measureChat";
+  measureChatBtn.textContent = "Add to chat";
+  measureChatBtn.style.display = "none";
+  viewport.appendChild(measureChatBtn);
+  measureChatBtn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    addMeasureToChat();
+  });
+
+  // The measured slot's events whose span touches the measured interval.
+  //
+  // Overlap rather than issue time: an instruction stalled across the whole window issued
+  // before it began, and it is the one holding the cycles being asked about.
+  function measureWindow() {
+    if (!measure || measure.active || !measure.forChat) return null;
+    if (measure.lane == null || measure.lane < 0) return null;
+    const lane = measure.lane;
+    const t1 = Math.round(Math.min(measure.start, measure.end));
+    const t2 = Math.round(Math.max(measure.start, measure.end));
+    if (t2 <= t1) return null;
+    // draw() asks on every frame; the interval stops moving at mouseup, so scan once.
+    const c = measure._window;
+    if (c && c.lane === lane && c.t1 === t1 && c.t2 === t2) return c.res;
+    const evs = [];
+    for (const e of eventsByLane[lane] || []) {
+      if (e.issue > t2) break; // sorted by issue
+      if (e.issue + Math.max(1, e.duration || 1) < t1) continue;
+      evs.push(e);
+    }
+    const res = evs.length ? { lane, t1, t2, evs } : null;
+    measure._window = { lane, t1, t2, res };
+    return res;
+  }
+
+  // Hand the measured slot's instructions to the MCP layer, the same way the listing's own
+  // selection goes, with the cycles the window covers named alongside them.
+  //
+  // One line per address, in address order: the window is a stretch of time, and a loop
+  // revisiting an address a hundred times would bury the body it iterates under repeats.
+  function addMeasureToChat() {
+    const w = measureWindow();
+    if (!w) {
+      showToast("Nothing ran on that slot in the measured cycles");
+      return;
+    }
+    const byPc = new Map();
+    let markerId = null;
+    for (const e of w.evs) {
+      if (markerId == null) markerId = e.marker_id;
+      if (!byPc.has(e.pc)) byPc.set(e.pc, String(e.asm || ""));
+    }
+    const addrs = [...byPc.keys()].sort((a, b) => a - b);
+    vscode.postMessage({
+      type: "attachSelection",
+      codeobjPath: codeobjFiles[String(markerId)] || currentCodeobjPath,
+      markerId,
+      begin: addrs[0],
+      end: addrs[addrs.length - 1],
+      lines: addrs.map((pc) => ({ addr: pc, text: byPc.get(pc) })),
+      window: {
+        slot: laneLabel(w.lane),
+        scope: laneTitle(w.lane),
+        begin: w.t1,
+        end: w.t2,
+        cycles: w.t2 - w.t1,
+      },
+    });
+  }
+
+  // The measurement also lands in the listing, which is where the reader goes next: the
+  // window names cycles, and the question behind it is always which instructions held them.
+  function syncWindowToDisasm() {
+    const w = measureWindow();
+    if (!w) return;
+    const pcs = new Set(w.evs.map((e) => e.pc));
+    const markerId = w.evs[0].marker_id;
+    if (sourceMode !== "disasm") setSourceMode("disasm");
+    if (markerId != null && String(markerId) !== String(currentMarkerId)) {
+      // The listing holds one code object at a time, and this window belongs to another:
+      // there are no lines to mark until it has been disassembled.
+      pendingWinSel = { markerId, pcs };
+      requestDisasm(markerId);
+      return;
+    }
+    applyWindowSel(markerId, pcs);
+  }
+
+  // The button rides beside the shaded region on the measured row, so it stays with the
+  // interval as the view is panned or zoomed under it.
+  function placeMeasureChat() {
+    const w = measureWindow();
+    if (!w) {
+      measureChatBtn.style.display = "none";
+      return;
+    }
+    measureChatBtn.style.display = "block";
+    measureChatBtn.title =
+      `Attach the ${new Set(w.evs.map((e) => e.pc)).size} instructions ${laneLabel(w.lane)} ran ` +
+      `in cycles [${w.t1}, ${w.t2}] to this trace's chat context, with the ${w.t2 - w.t1} ` +
+      "cycles they took, so att_current hands them to the model.";
+    const bw = measureChatBtn.offsetWidth || 86;
+    const bh = measureChatBtn.offsetHeight || 22;
+    const x1 = xScale(w.t1);
+    const x2 = xScale(w.t2);
+    let x = Math.max(x1, x2) + 6;
+    if (x + bw > cssW - 8) x = Math.min(x1, x2) - bw - 6;
+    x = Math.max(LEFT_PAD + 4, Math.min(x, cssW - bw - 8));
+    const y = laneYByLane[w.lane] + laneHByLane[w.lane] / 2 - bh / 2;
+    measureChatBtn.style.left = Math.round(x) + "px";
+    measureChatBtn.style.top = Math.round(Math.max(2, Math.min(y, cssH - bh - 2))) + "px";
+  }
 
   function drawMeasureOverlay() {
     if (!measure) return;
@@ -3359,22 +3538,33 @@
     const left = Math.min(x1, x2);
     const width = Math.max(1, Math.abs(x2 - x1));
 
+    // A ctrl+drag measures the dispatch's clock, so its window spans every row. A shift+drag
+    // measures one slot's work, and shading the rows it says nothing about would claim their
+    // cycles too: it covers that row alone.
+    const onRow = measure.forChat && measure.lane != null && measure.lane >= 0;
+    const top = onRow ? laneYByLane[measure.lane] : 0;
+    const height = onRow ? laneHByLane[measure.lane] : cssH;
+
     ctx.save();
     // shaded region + boundary lines
-    ctx.fillStyle = "rgba(255,255,255,0.08)";
-    ctx.fillRect(left, 0, width, cssH);
+    ctx.fillStyle = onRow ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.08)";
+    ctx.fillRect(left, top, width, height);
     ctx.strokeStyle = "rgba(255,255,255,0.35)";
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(left, 0);
-    ctx.lineTo(left, cssH);
-    ctx.moveTo(left + width, 0);
-    ctx.lineTo(left + width, cssH);
+    ctx.moveTo(left, top);
+    ctx.lineTo(left, top + height);
+    ctx.moveTo(left + width, top);
+    ctx.lineTo(left + width, top + height);
     ctx.stroke();
 
     // label
     const dt = Math.round(t2 - t1);
-    const label = `Δ ${dt} cycles   [${Math.round(t1)}, ${Math.round(t2)}]`;
+    const slot =
+      measure.forChat && measure.lane != null && measure.lane >= 0
+        ? `   ${laneLabel(measure.lane)}`
+        : "";
+    const label = `Δ ${dt} cycles   [${Math.round(t1)}, ${Math.round(t2)}]${slot}`;
     ctx.font = "12px ui-sans-serif, system-ui";
     ctx.textBaseline = "top";
     const padX = 6;
@@ -3430,6 +3620,7 @@
       ctx.restore();
     }
     drawMeasureOverlay();
+    placeMeasureChat();
     // selected outline
     if (selected) {
       const lane = selected.lane;
@@ -3626,9 +3817,19 @@
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left + viewport.scrollLeft;
     const c = cycleAtX(x);
-    // Measurement mode: Ctrl + left mouse
-    if (ev.button === 0 && ev.ctrlKey) {
-      measure = { active: true, start: c, end: c, justFinished: false };
+    // Measurement mode: Ctrl + left mouse measures the interval alone; Shift + left mouse
+    // measures it on one slot's row, which is the form that can be handed to the chat.
+    if (ev.button === 0 && (ev.ctrlKey || ev.shiftKey)) {
+      const forChat = ev.shiftKey;
+      const y = ev.clientY - rect.top + viewport.scrollTop;
+      measure = {
+        active: true,
+        start: c,
+        end: c,
+        forChat,
+        lane: forChat ? laneAtY(y) : -1,
+        justFinished: false,
+      };
       requestDraw();
       ev.preventDefault();
       return;
@@ -3651,6 +3852,7 @@
       measure.active = false;
       measure.justFinished = true;
       requestDraw();
+      if (measure.forChat) syncWindowToDisasm();
       setTimeout(() => {
         if (measure) measure.justFinished = false;
       }, 60);

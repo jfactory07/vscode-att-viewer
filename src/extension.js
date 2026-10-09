@@ -141,6 +141,9 @@ function recordSelection(attPath, msg) {
     end: msg.end,
     count: Array.isArray(msg.lines) ? msg.lines.length : 0,
     truncated: Array.isArray(msg.lines) && msg.lines.length > lines.length,
+    // present when the reader measured an interval on one slot's row rather than selecting
+    // lines in the listing: the cycles are half of what that gesture points at
+    window: msg.window || null,
     lines,
     attached: Math.floor(Date.now() / 1000),
   };
@@ -169,9 +172,19 @@ function selectionListing(attPath, msg) {
   const hex = (v) => "0x" + Number(v).toString(16);
   const lines = Array.isArray(msg.lines) ? msg.lines : [];
   const w = Math.max(...lines.map((x) => hex(x.addr).length), 0);
+  const win = msg.window;
   const head = [
-    `; ${lines.length} instructions selected in the ATT trace ${path.basename(attPath)}, ` +
-      `${hex(msg.begin)}\u2013${hex(msg.end)}.`,
+    ...(win
+      ? [
+          `; ${lines.length} instructions ${win.slot} ran in the ATT trace ` +
+            `${path.basename(attPath)}, ${hex(msg.begin)}\u2013${hex(msg.end)}.`,
+          `; Measured on the timeline over cycles [${win.begin}, ${win.end}]: ${win.cycles} ` +
+            `cycles of latency on ${win.scope}.`,
+        ]
+      : [
+          `; ${lines.length} instructions selected in the ATT trace ${path.basename(attPath)}, ` +
+            `${hex(msg.begin)}\u2013${hex(msg.end)}.`,
+        ]),
     ";",
     "; Call att_current for the trace and this selection, then att_disasm with",
     `; begin=${hex(msg.begin)} end=${hex(msg.end)} for the stall cycles measured against`,
@@ -201,9 +214,13 @@ function writeSelectionFile(attPath, msg) {
   const hex = (v) => "0x" + Number(v).toString(16);
   const dir = selectionsDir();
   fs.mkdirSync(dir, { recursive: true });
+  // The cycles are part of what a measured window is: two drags over the same loop body
+  // differ by when they were taken, and a file named only by address would overwrite one
+  // with the other.
+  const win = msg.window ? `_c${msg.window.begin}-${msg.window.end}` : "";
   const file = path.join(
     dir,
-    `${path.basename(attPath, ".att")}_${hex(msg.begin)}-${hex(msg.end)}.s`
+    `${path.basename(attPath, ".att")}_${hex(msg.begin)}-${hex(msg.end)}${win}.s`
   );
   fs.writeFileSync(file, selectionListing(attPath, msg), "utf8");
   return file;
@@ -214,6 +231,12 @@ function writeSelectionFile(attPath, msg) {
 // Everything else is in the attached file, which is the point of attaching it.
 function attachedQuestion(msg) {
   const n = Array.isArray(msg.lines) ? msg.lines.length : 0;
+  if (msg.window) {
+    return (
+      `What is costing ${msg.window.slot} the ${msg.window.cycles} cycles it spent on these ` +
+      `${n} attached instructions?`
+    );
+  }
   return `What is costing time in these ${n} attached instructions?`;
 }
 
@@ -393,7 +416,7 @@ function getWebviewHtml(webview, ctx, jsonUri, traceKey) {
       <div class="legend" id="legend"></div>
       <button class="btn" id="phasesBtn" title="Mark prologue / mainline / epilogue on the timeline, cut at the hot loop the trace spun in">Phases</button>
       <button class="btn" id="colorsBtn" title="Edit colors">Colors</button>
-      <div class="hint">wheel=zoom, drag=pan, alt+click=marker</div>
+      <div class="hint">wheel=zoom, drag=pan, ctrl+drag=measure, shift+drag=slot→chat, alt+click=marker</div>
     </div>
     <div class="main">
       <div class="viewport" id="viewport">

@@ -277,23 +277,40 @@ def t_current(runs: Dict[str, Run], **_) -> str:
 
 
 def _selection(sel) -> List[str]:
-    """Render the instructions the user highlighted in the panel, if they attached any."""
+    """Render what the user pointed at in the panel, if they attached anything.
+
+    Two gestures arrive here. Lines picked in the listing are a piece of the program, and the
+    count of executions belongs beside each one. An interval measured on one slot's row is a
+    piece of *time*: the instructions are whatever that slot was holding during it, listed once
+    each, and the number that matters is the latency the window covers.
+    """
     if not isinstance(sel, dict) or not sel.get("lines"):
         return []
     lines, lo, hi = sel["lines"], sel.get("begin"), sel.get("end")
+    win = sel.get("window") if isinstance(sel.get("window"), dict) else None
     age = int(time.time()) - int(sel.get("attached") or 0)
     when = f"{age//3600}h ago" if age >= 3600 else (f"{age//60}m ago" if age >= 60 else "just now")
+    count = sel.get("count", len(lines))
 
-    o = [f"## The user selected {sel.get('count', len(lines))} instructions in this trace "
-         f"({when})", ""]
+    if win:
+        o = [f"## The user measured {n(win.get('cycles'))} cycles of {win.get('slot')} in this "
+             f"trace ({when})", "",
+             f"Cycles [{win.get('begin')}, {win.get('end')}] on {win.get('scope')}: "
+             f"{n(win.get('cycles'))} cycles of latency. These are the {count} instructions "
+             "that slot was running or stalled on during them, one line per address.", ""]
+    else:
+        o = [f"## The user selected {count} instructions in this trace ({when})", ""]
     if sel.get("codeobj"):
         o += [f"Code object `{sel['codeobj']}`", ""]
-    o.append(table([[f"0x{int(x.get('addr', 0)):x}", str(x.get("text", "")), n(x.get("hits", 0))]
-                    for x in lines],
-                   ["addr", "instruction", "executions"]))
+    head = ["addr", "instruction"] if win else ["addr", "instruction", "executions"]
+    o.append(table([[f"0x{int(x.get('addr', 0)):x}", str(x.get("text", ""))]
+                    + ([] if win else [n(x.get("hits", 0))])
+                    for x in lines], head))
     if sel.get("truncated"):
-        o.append(f"\n(listing truncated to {len(lines)} of {sel.get('count')} lines)")
-    hint = "Treat this selection as what the user means by 'these instructions' or 'this code'."
+        o.append(f"\n(listing truncated to {len(lines)} of {count} lines)")
+    hint = ("Treat this window as what the user means by 'this stretch', 'these cycles' or "
+            "'these instructions'." if win else
+            "Treat this selection as what the user means by 'these instructions' or 'this code'.")
     if lo is not None and hi is not None:
         hint += (" For surrounding context and per-instruction stall cycles, call att_disasm "
                  f"with begin=0x{int(lo):x} end=0x{int(hi):x}.")
