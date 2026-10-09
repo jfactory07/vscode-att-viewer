@@ -253,6 +253,7 @@ function attachedQuestion(msg) {
 // The id is not API and the command does not report what it did, so a throw is the only
 // failure that can be detected here — a chip that draws is not proof the chat can be sent.
 const ATTACH_CMD = "aichat.newchataction";
+const VSCODE_CHAT_OPEN = "workbench.action.chat.open";
 
 // Append what "Add to chat" did. None of the commands it drives report success, and the
 // panel's only other account of itself is a toast that has faded by the time anyone asks
@@ -315,6 +316,22 @@ async function outputHolds(listing, budgetMs = 2000) {
 // is not a Monaco editor, so on Cursor 1.128 it resolved without throwing and without doing
 // anything, and the panel reported success into a void.
 async function attachSelection(attPath, msg) {
+  // VS Code has no Cursor command, but its chat.open takes the files to attach directly.
+  if (!chatCommands.has(ATTACH_CMD) && chatCommands.has(VSCODE_CHAT_OPEN)) {
+    const file = writeSelectionFile(attPath, msg);
+    try {
+      await vscode.commands.executeCommand(VSCODE_CHAT_OPEN, {
+        query: attachedQuestion(msg),
+        isPartialQuery: true,
+        attachFiles: [vscode.Uri.file(file)],
+      });
+      chatLog(`vscode: ${VSCODE_CHAT_OPEN} attached ${file}`);
+      return { how: `attached to the chat as ${path.basename(file)}` };
+    } catch (e) {
+      chatLog(`vscode: attach failed — ${e && e.message}`);
+      return { how: "", why: `${VSCODE_CHAT_OPEN} rejected the selection: ${e && e.message}` };
+    }
+  }
   if (!chatCommands.has(ATTACH_CMD) || !chatCommands.has("editor.action.selectAll")) {
     return {
       how: "",
@@ -482,7 +499,7 @@ function activate(context) {
             {
               app: vscode.env.appName,
               version: vscode.version,
-              attach: [ATTACH_CMD].filter((c) => chatCommands.has(c)),
+              attach: [ATTACH_CMD, VSCODE_CHAT_OPEN].filter((c) => chatCommands.has(c)),
               related: all.filter((c) => /chat|composer|aichat/i.test(c)).sort(),
               output: all.filter((c) => /output|selectAll/i.test(c)).sort(),
             },

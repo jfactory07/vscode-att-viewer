@@ -4,6 +4,20 @@ All notable changes to this extension will be documented in this file.
 
 ## Unreleased
 
+- A zoomed-out timeline draws in one fill per color. With the event cap lifted a long trace
+  put close to a million bars into a few thousand pixels, each one a rounded rect of its own
+  and each stall line a save, stroke and restore, so every pan redrew over a million paths.
+  Bars narrower than 3 px are now plain rects batched by color, a bar whose pixels its
+  sub-row has already painted is skipped, and the stall lines are one path; zoomed in, where
+  the bars are wide, they are drawn as before. The selected outline no longer rescans the
+  whole slot on every frame either, only when the selection changes
+- The header gives the cycle span next to the interval, so the length of the capture is read
+  off rather than subtracted by hand
+- `Add to chat` works in VS Code. It drove Cursor's `aichat.newchataction`, which VS Code does
+  not have, so every attach there failed. Where that command is missing and
+  `workbench.action.chat.open` is present, the selection is written to its `.s` file and the
+  chat opens with the question filled in and that file attached; Cursor keeps the output-view
+  path
 - A shift+drag on the timeline names a slot as well as an interval, and the `Add to chat`
   button that appears beside it attaches what that slot ran in those cycles. The measurement
   was a pair of cycle numbers and nothing else, so a reader who had just measured 757 cycles

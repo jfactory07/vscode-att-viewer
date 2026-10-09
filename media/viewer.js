@@ -332,7 +332,7 @@
   const scopeText = (sameCu && sameSimd)
     ? `${CU_WORD}=${laneInfo[0].cu} simd=${laneInfo[0].simd}  `
     : "";
-  metaEl.textContent = `${scopeText}slots=${lanes}  events=${DATA.events.length}  cycles=[${DATA.min_cycle}, ${DATA.max_cycle}]`;
+  metaEl.textContent = `${scopeText}slots=${lanes}  events=${DATA.events.length}  cycles=[${DATA.min_cycle}, ${DATA.max_cycle}] (${(DATA.max_cycle - DATA.min_cycle).toLocaleString()} cycles)`;
 
   function renderLegend() {
     legendEl.innerHTML = "";
@@ -448,6 +448,7 @@
   let disasmLines = []; // [{addr,text,file?,line?}]
   let disasmAddrToEl = new Map();
   let selected = null; // { marker_id, pc, lane, issue }
+  let selectedEvCache = { sel: null, ev: null };
   let sourceMode = "disasm"; // "disasm" | "occ"
   let occSelectedKey = null; // `${lane}|${issue}|${pc}`
   let occLaneFilter = null; // null = all lanes, else lane id number
@@ -3343,12 +3344,25 @@
     };
   }
 
+  // Zoomed out, a long trace puts hundreds of thousands of events into a few thousand pixels:
+  // bars narrower than LOD_PX become plain rects batched per color, and a bar whose pixels its
+  // sub-row has already painted is skipped, so a frame costs one fill per color.
+  const LOD_PX = 3;
   function drawEvents() {
+    const pad = (view.max - view.min) * 0.05;
+    const k = (cssW - LEFT_PAD - 10) / (view.max - view.min || 1);
+    const x0 = LEFT_PAD - view.min * k;
+    const rectsByColor = new Map();
+    const stallPath = new Path2D();
+
     for (let lane = 0; lane < lanes; lane++) {
       const rowH = subHByLane[lane];
       const evs = eventsByLane[lane];
+      const rowBase = laneYByLane[lane] + ROW_PAD;
+      const rowStep = rowH + SUB_GAP;
+      const barDone = new Float64Array(subRowsByLane[lane]).fill(-Infinity);
+      const stallDone = new Float64Array(subRowsByLane[lane]).fill(-Infinity);
 
-      const pad = (view.max - view.min) * 0.05;
       let lo = 0,
         hi = evs.length;
       const target = view.min - pad - maxSpanByLane[lane];
@@ -3358,38 +3372,70 @@
         else hi = mid;
       }
 
+      const tEnd = view.max + pad;
       for (let i = lo; i < evs.length; i++) {
         const e = evs[i];
-        if (e.issue > view.max + pad) break;
-        const s = eventSpan(e);
-        const rowY = subRowY(lane, e.depth);
+        const t0 = e.issue;
+        if (t0 > tEnd) break;
+        // Inlined eventSpan(): this loop runs once per visible event per frame.
+        const stall = e.stall > 0 ? e.stall : 0;
+        const dur = e.duration > 0 ? e.duration : 1;
+        const exec = dur > stall ? dur - stall : 0;
+        const spanBar = stall > 0 && e.cat === "IMMED";
+        const d = e.depth || 0;
+        const rowY = rowBase + d * rowStep;
 
-        if (s.hasBar) {
-          const x1 = xScale(s.barStart);
-          const x2 = xScale(s.barStart + Math.max(1, s.barLen));
-          const ww = Math.max(1, x2 - x1);
-          ctx.fillStyle = COLORS[e.cat] || "#999";
-          // rounded bars to make separation clearer
-          fillRoundRect(x1, rowY, ww, rowH, 3);
+        if (spanBar || exec > 0) {
+          const barStart = spanBar ? t0 : t0 + stall;
+          const barLen = spanBar ? dur : exec;
+          const x1 = x0 + barStart * k;
+          const x2 = x0 + (barStart + (barLen > 1 ? barLen : 1)) * k;
+          const ww = x2 - x1 > 1 ? x2 - x1 : 1;
+          const color = COLORS[e.cat] || "#999";
+          if (ww >= LOD_PX) {
+            ctx.fillStyle = color;
+            fillRoundRect(x1, rowY, ww, rowH, 3);
+            barDone[d] = Math.ceil(x1 + ww);
+          } else {
+            const c1 = Math.floor(x1);
+            const c2 = Math.max(c1 + 1, Math.ceil(x1 + ww));
+            if (c2 > barDone[d]) {
+              const start = c1 > barDone[d] ? c1 : barDone[d];
+              let arr = rectsByColor.get(color);
+              if (!arr) rectsByColor.set(color, (arr = []));
+              arr.push(start, rowY, c2 - start, rowH);
+              barDone[d] = c2;
+            }
+          }
         }
 
-        // stall line (aligned to the bottom edge of this event's sub-row): [t0, t0 + stall]
-        if (s.hasStallLine) {
-          const sx1 = xScale(s.t0);
-          const sx2 = xScale(s.t0 + s.stall);
-          // bottom edge of the bar, keep inside pixels
-          const yy = rowY + rowH - 1;
-          ctx.save();
-          ctx.strokeStyle = stallColor;
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(sx1, yy);
-          ctx.lineTo(Math.max(sx1 + 1, sx2), yy);
-          ctx.stroke();
-          ctx.restore();
+        // stall line along the bottom edge of this event's sub-row: [t0, t0 + stall]
+        if (stall > 0 && !spanBar) {
+          const sx1 = x0 + t0 * k;
+          const sx2 = x0 + (t0 + stall) * k;
+          const sEnd = Math.max(sx1 + 1, sx2);
+          if (sEnd > stallDone[d] + 0.5) {
+            const yy = rowY + rowH - 1;
+            stallPath.moveTo(sx1 > stallDone[d] ? sx1 : stallDone[d], yy);
+            stallPath.lineTo(sEnd, yy);
+            stallDone[d] = sEnd;
+          }
         }
       }
     }
+
+    for (const [color, arr] of rectsByColor) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (let j = 0; j < arr.length; j += 4) ctx.rect(arr[j], arr[j + 1], arr[j + 2], arr[j + 3]);
+      ctx.fill();
+    }
+    // Stall lines go last, as each one used to be drawn right after its own bar.
+    ctx.save();
+    ctx.strokeStyle = stallColor;
+    ctx.lineWidth = 1;
+    ctx.stroke(stallPath);
+    ctx.restore();
   }
 
   function requestDraw() {
@@ -3626,15 +3672,20 @@
       const lane = selected.lane;
       const rowH = subHByLane[lane];
       // find the event at this pc near this issue
-      const evs = eventsByLane[lane] || [];
-      let e = null;
-      let bestDist = Infinity;
-      for (let i = 0; i < evs.length; i++) {
-        const it = evs[i];
-        if (it.pc !== selected.pc || it.marker_id !== selected.marker_id) continue;
-        const d = Math.abs((it.issue || 0) - (selected.issue || 0));
-        if (d < bestDist) { bestDist = d; e = it; }
+      // selected is replaced, never mutated, so the linear scan only reruns on a new selection.
+      if (selectedEvCache.sel !== selected) {
+        const evs = eventsByLane[lane] || [];
+        let best = null;
+        let bestDist = Infinity;
+        for (let i = 0; i < evs.length; i++) {
+          const it = evs[i];
+          if (it.pc !== selected.pc || it.marker_id !== selected.marker_id) continue;
+          const d = Math.abs((it.issue || 0) - (selected.issue || 0));
+          if (d < bestDist) { bestDist = d; best = it; }
+        }
+        selectedEvCache = { sel: selected, ev: best };
       }
+      const e = selectedEvCache.ev;
       if (e) {
         const s = eventSpan(e);
         const rowY = subRowY(lane, e.depth);
